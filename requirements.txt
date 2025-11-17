@@ -3,6 +3,8 @@ trimesh
 numpy
 scipy
 pytorch3d
+einops
+open3d
 
 # Optional: For simplifying meshes
 pyfqmr

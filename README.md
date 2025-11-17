@@ -1,6 +1,6 @@
 
 # Faithful Contouring
-🤬 ***Enough with SDF + Marching Cubes? 📐Time to bring back faithful geometry!***
+🤬 ***Enough with SDF + Marching Cubes? 📐 Time to Bring Geometry back — Faithfully.***
 
 ![Teaser](imgs/Cover_FCT.png)
 **Faithful Contouring**: A high-fidelity, near-lossless 3D mesh representation method that eliminates the need for distance-field conversion and iso-surface extraction.  
@@ -10,7 +10,9 @@ This official library provides a CUDA-accelerated **Encoder/Decoder pipeline** t
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![PyTorch Version](https://img.shields.io/badge/pytorch-1.12+-orange.svg)](https://pytorch.org/) [![arXiv](https://img.shields.io/badge/arXiv-2511.04029-b31b1b.svg)](https://arxiv.org/abs/2511.04029)  [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
 
-[🔒 Source Code Not Fully Released Yet](src/)
+⚙️ Compiled Wheel Package Available for Linux + Python 3.10 + CUDA 11.8  
+[🔽 Installation Instructions](#installation)
+🔒 Source Code Not Fully Released Yet](src/)
 ## Overview
 
 Conventional voxel-based mesh representations typically rely on distance fields (SDF/UDF) and iso-surface extraction through Marching Cubes and its variations. These pipelines require watertight preprocessing and global sign computation, which often introduce artifacts including surface thickening, jagged iso-surfaces, and loss of internal structures.
@@ -67,6 +69,7 @@ Encoding produces two main tensors:
       
 
 ## Installation
+<a id="installation"></a>
 
 This project requires a system with an NVIDIA GPU, CUDA Toolkit, and a C++ compiler.
 
@@ -75,10 +78,19 @@ This project requires a system with an NVIDIA GPU, CUDA Toolkit, and a C++ compi
 For quick installation without compilation:
 
 ```bash
+## 
+conda create -n faithc python=3.10
+conda activate faithc
 
 # Install PyTorch first (make sure it matches your CUDA version)
 # Example for CUDA 11.8
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+
+## Install other dependencies
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.1+cu118.html
+pip install torch_geometric
+pip install https://github.com/MiroPsota/torch_packages_builder/releases/download/pytorch3d-0.7.8/pytorch3d-0.7.8+pt2.4.1cu118-cp310-cp310-linux_x86_64.whl
+pip install trimesh scipy einops open3d
 
 # Clone the repository
 git clone https://github.com/Luo-Yihao/FaithC.git
@@ -184,8 +196,23 @@ final_mesh.export("reconstructed_mesh.glb")
 
 Distributed under the Attribution-NonCommercial 4.0 International License. See `LICENSE` for more information.
 
+## Citation
+If you find this project useful in your research, please consider citing:
+```bibtex
+@misc{luo2025faithfulcontouringnearlossless3d,
+      title={Faithful Contouring: Near-Lossless 3D Voxel Representation Free from Iso-surface}, 
+      author={Yihao Luo and Xianglong He and Chuanyu Pan and Yiwen Chen and Jiaqi Wu and Yangguang Li and Wanli Ouyang and Yuanming Hu and Guang Yang and ChoonHwai Yap},
+      year={2025},
+      eprint={2511.04029},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2511.04029}, 
+}
+```
+
 ## Contact
 
 Yihao Luo - y.luo23@imperial.ac.uk
 
 Project Link: [https://github.com/Luo-Yihao/FaithC](https://github.com/Luo-Yihao/FaithC)
+
