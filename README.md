@@ -4,199 +4,239 @@
 
 ![Teaser](imgs/Cover_FCT.png)
 **Faithful Contouring**: A high-fidelity, near-lossless 3D mesh representation method that eliminates the need for distance-field conversion and iso-surface extraction.  
-This official library provides a CUDA-accelerated **Encoder/Decoder pipeline** to transform arbitrary meshes into compact **Faithful Contour Tokens (FCTs)**, together with an efficient remeshing algorithm for precise reconstruction.
+This official library provides a GPU-accelerated **Encoder/Decoder pipeline** to transform arbitrary meshes into compact **Faithful Contour Tokens (FCTs)**, together with an efficient remeshing algorithm for precise reconstruction.
 
 
-[![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![PyTorch Version](https://img.shields.io/badge/pytorch-1.12+-orange.svg)](https://pytorch.org/) [![arXiv](https://img.shields.io/badge/arXiv-2511.04029-b31b1b.svg)](https://arxiv.org/abs/2511.04029)  [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+[![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/) [![PyTorch Version](https://img.shields.io/badge/pytorch-2.0+-orange.svg)](https://pytorch.org/) [![arXiv](https://img.shields.io/badge/arXiv-2511.04029-b31b1b.svg)](https://arxiv.org/abs/2511.04029)  [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
 
-⚙️ Compiled Wheel Package Available for Linux + Python 3.10 + CUDA 11.8  
-[🔽 Installation Instructions](#installation)
-🔒 Source Code Not Fully Released Yet](src/)
+## 📢 News
+
+- **[2025-12-17]** 🎉 **Code fully open-sourced!** Complete encoder/decoder implementation now available. No more waiting for source access!
+- **[2025-12-17]** 🚀 **v1.5 released** — Pure Python implementation with Atom3d, no C++ compilation required.
+
+
+## What's New in v1.5
+
+> **🚀 Major Update: Pure Python Implementation with Atom3d**
+
+### Architecture Changes
+
+| Aspect | v0.1 (Legacy) | v1.5 (Current) |
+|--------|---------------|----------------|
+| **Backend** | Custom CUDA C++ kernels | Pure Python + Atom3d CUDA operators |
+| **Dependencies** | External `cubvh` library | Internal Atom3d primitives |
+| **Build** | Requires C++ compilation | **No compilation needed** |
+| **Installation** | Complex, CUDA version matching | Simple `pip install` |
+
+### FCT Format Changes
+
+| Field | v0.1 (69 dims) | v1.5 (18 dims) |
+|-------|----------------|----------------|
+| **Primal anchor** | position (3) + normal (3) | position (3) + normal (3) |
+| **Dual anchors** | 8 × (position + normal + mask) = 56 dims | ❌ Removed |
+| **Semi-axis directions** | 6 dims | ❌ Removed |
+| **Edge flux signs** | ❌ Not included | ✅ **12 dims** (new) |
+
+### Decoder Changes
+
+| Aspect | v0.1 | v1.5 |
+|--------|------|------|
+| **Reconstruction** | Primal-dual connectivity | **Edge-based quad extraction** |
+| **Face generation** | Connect primal to dual points | Form quads from 4 incident voxel anchors |
+| **Triangulation** | Fixed pattern | **Adaptive** (normal/length-based) |
+
+### Key Benefits
+- ✅ **No C++ compilation** — Pure Python, easy to install and modify
+- ✅ **Simpler FCT format** — 18 dims vs 69 dims, more efficient storage
+- ✅ **Edge flux decoding** — More robust mesh reconstruction
+- ✅ **Atom3d integration** — Shared CUDA operators with other geometry projects
+
+### Performance (v1.5)
+
+Benchmark on icosphere mesh (NVIDIA H100 GPU):
+
+| Resolution | Active Voxels | Encode | Decode | Total |
+|------------|---------------|--------|--------|-------|
+| 128 | 71K | 0.27s | 0.02s | 0.29s |
+| 256 | 287K | 0.45s | 0.06s | 0.51s |
+| 512 | 1.1M | 0.52s | 0.17s | 0.70s |
+| 1024 | 4.6M | 0.82s | 0.61s | 1.42s |
+| 2048 | 18.4M | 2.16s | 2.51s | 4.68s |
+
+
 ## Overview
 
 Conventional voxel-based mesh representations typically rely on distance fields (SDF/UDF) and iso-surface extraction through Marching Cubes and its variations. These pipelines require watertight preprocessing and global sign computation, which often introduce artifacts including surface thickening, jagged iso-surfaces, and loss of internal structures.
 
-**Faithful Contouring** avoids these issues by directly operating on the raw mesh. It identifies all surface-intersecting voxels and solves for a compact set of local anchor features — a **primal anchor**, its eight **dual anchors**, and six **semi-axis orientations** — forming the **Faithful Contour Token (FCT)**.  
-
-
-At the core of this method is the **Faithful Contour Tokens (FCT)** — a compact per-voxel representation.  
-Each active voxel is represented by:
-- one **primal anchor** (position + normal),
-- up to eight **dual anchors** (positions + normals),
-- and six **semi-axis orientations** indicating directional connectivity.
+**Faithful Contouring** avoids these issues by directly operating on the raw mesh. It identifies all surface-intersecting voxels and solves for a compact set of local anchor features.
 
 This design ensures:
 - **High fidelity** – sharp edges and internal structures are preserved, even for open or non-manifold meshes.  
-- **Scalability** – efficient CUDA kernels enable resolutions up to 2048+.  
+- **Scalability** – efficient GPU kernels enable resolutions up to 2048+.  
 - **Flexibility** – token-based format supports filtering, texturing, manipulation, and assembly for downstream applications.  
 
 ![Compare](imgs/WUKONGCOMPARE.png) 
 
-Faithful Contouring thus provides both a practical mesh processing pipeline and a standardized tokenized format (FCT) that can be directly integrated into learning-based 3D reconstruction and generative modeling. Check [here](imgs/Comparision_FCT.pdf) for detailed comparisons with traditional SDF+MC pipelines. VAE reconstruction results can be found [here](imgs/FCT_VAEComp.pdf).
 
 ## How It Works
 
 The pipeline consists of two main components: an encoder and a decoder.
 
-1.  **Encoder (`FCT_encoder`)**:
+1.  **Encoder (`FCTEncoder`)**:
     - Takes a standard triangle mesh (vertices, faces) as input.
-    - Performs a multi-level octree traversal from a coarse `min_level` to a fine `max_level`.
-    - At each level, it uses fast, CUDA-based AABB intersection tests to prune empty regions and identify active cells for the next, finer level.
-    - At the `max_level`, it runs a detailed intersection analysis on the final set of active primal and dual cells to compute precise feature points (as offsets from cell centers).
-    - Outputs the two tensors that constitute the Faithful Contour Tokens。
+    - Builds a BVH (Bounding Volume Hierarchy) for fast intersection queries.
+    - Performs hierarchical octree traversal from coarse to fine levels.
+    - At each level, uses BVH-accelerated AABB intersection to prune empty regions.
+    - At the finest level, performs SAT polygon clipping to compute precise anchors and normals.
+    - Computes **edge flux signs** via segment-triangle intersection for surface crossing directions.
 
-2.  **Decoder (`FCT_decoder`)**:
-    - Takes the `active_voxels_indices` and `FCT_features` tokens as input.
-    - Reconstructs the absolute world-space positions of all primal and dual feature points.
-    - Establishes connectivity between primal and dual points based on the primal-dual grid structure.
-    - Generates triangular faces by connecting each primal point to its valid dual neighbors, perfectly restoring the original mesh topology.
+2.  **Decoder (`FCTDecoder`)**:
+    - Takes the FCT tokens (anchor, normal, edge_flux_sign) as input.
+    - Finds edges with non-zero flux (indicating surface crossing).
+    - Forms **quads** from the 4 voxels incident to each active edge.
+    - Triangulates quads based on normal consistency.
+    - Outputs a reconstructed triangle mesh.
 
-## FCT Format
-Encoding produces two main tensors:
 
-- **`active_voxels_indices`** `[K]`  
-  Linear indices of active primal voxels.
+## FCT Format (v1.5)
 
-- **`FCT_features`** `[K, 69]`  
-  Per-voxel features containing:
-  - **Primal anchor**: position (3) + normal (3)  
-  - **Dual anchors**: 8 positions (8×3) + normals (8×3), with mask (8)  
-  - **Semi-axis directions**: 6 orientation flags (±x, ±y, ±z)  
+Encoding produces an `FCTResult` dataclass with:
 
-> - Not all features are mandatory; Only the dual masks, anchor positions, and semi-axis directions are essential for reconstruction. 
-> - Texture and Semantic Partitions can be attached as additional channels in `FCT` for advanced applications.
-      
+| Field | Shape | Description |
+|-------|-------|-------------|
+| `active_voxel_indices` | `[K]` | Linear indices of active voxels |
+| `anchor` | `[K, 3]` | Per-voxel surface anchor point |
+| `normal` | `[K, 3]` | Per-voxel surface normal direction |
+| `edge_flux_sign` | `[K, 12]` | Edge crossing signs {-1, 0, +1} for 12 edges |
+
+**Total: 18 dimensions per voxel** (vs 69 dims in v0.1)
+
+> The simplified format focuses on **edge flux** for reconstruction, which is more robust than the dual-anchor approach.
+
 
 ## Installation
 <a id="installation"></a>
 
-This project requires a system with an NVIDIA GPU, CUDA Toolkit, and a C++ compiler.
+This project requires a system with an NVIDIA GPU and PyTorch.
 
-### Method 1: Pre-compiled Wheel (Recommended)
+### Step 1: Install Atom3d (Required Dependency)
 
-For quick installation without compilation:
+FaithContour v1.5 is built on [Atom3d](https://github.com/Luo-Yihao/Atom3d), which provides efficient BVH-accelerated geometry operations.
 
 ```bash
-## 
+pip install git+https://github.com/Luo-Yihao/Atom3d.git --no-build-isolation
+```
+
+### Step 2: Install FaithContour
+
+```bash
+# Create conda environment (recommended)
 conda create -n faithc python=3.10
 conda activate faithc
 
-# Install PyTorch first (make sure it matches your CUDA version)
+# Install PyTorch (match your CUDA version)
 # Example for CUDA 11.8
 pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118
 
-## Install other dependencies
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.1+cu118.html
-pip install torch_geometric
-pip install https://github.com/MiroPsota/torch_packages_builder/releases/download/pytorch3d-0.7.8/pytorch3d-0.7.8+pt2.4.1cu118-cp310-cp310-linux_x86_64.whl
-pip install trimesh scipy einops open3d
+# Install dependencies
+pip install torch_scatter -f https://data.pyg.org/whl/torch-2.4.1+cu118.html
+pip install trimesh scipy einops
 
-# Clone the repository
-git clone https://github.com/Luo-Yihao/FaithC.git
-cd FaithC
-
-# Install the pre-compiled wheel directly
-pip install dist/faithcontour-0.1.0-cp310-cp310-linux_x86_64.whl
-```
-
-**Wheel Requirements**:
-- Python 3.10
-- Linux x86_64 systems
-- CUDA-capable NVIDIA GPUs
-
-### Method 2: Build from Source
-
-If the pre-compiled wheel doesn't work for your system:
-(Get the source code first! For earlier access, contact the author.)
-```bash
-# Put the source code in a folder named `src/faithcontour/`
-# Install the library in editable mode (compiles C++/CUDA code)
+# Clone and install FaithContour
+git clone https://github.com/Luo-Yihao/FC_dev.git
+cd FC_dev
 pip install -e .
 ```
 
-**Build Requirements**:
-- NVIDIA GPU with CUDA support
-- CUDA Toolkit 11.0+
-- C++ compiler (GCC 7+)
-- PyTorch 1.12+
+**Requirements**:
+- Python 3.9+
+- PyTorch 2.0+
+- CUDA-capable NVIDIA GPU
+- Atom3d (installed in Step 1)
+
 
 ## Usage
 
-The provided `demo.py` script is the easiest way to use the encoder/decoder pipeline.
+### Demo Script
 
-**To encode a mesh into the Faithful Contour Tokens (FCT) format and immediately decode it back:**
+The provided `demo.py` is the easiest way to test the pipeline:
+
 ```bash
+# Default icosphere
+python demo.py -r 128
+
+# Custom mesh
 python demo.py -p assets/examples/pirateship.glb -r 512 -o output/pirateship.glb
 ```
 
-**Command-Line Arguments:**
-- `path`: (Optional) Path to the input mesh file. Default: Spherical Polyhedron.
-- `res`:   (Optional) Final grid resolution. Must be a power of two. Default: `512`.
-- `output`: (Optional) Path for the output reconstructed mesh file. Default: `reconstructed_mesh.obj`.
-- `rescale`: (Optional) Rescaling factor for mesh normalization into [-1, 1]. Default: `0.95`.
-- `if_simplify`: (Optional) Whether to simplify the output mesh using quadric edge collapse decimation. Default: `True`.
+**Arguments:**
+- `-p, --mesh_path`: Path to input mesh file
+- `-r, --res`: Grid resolution (power of 2). Default: `128`
+- `-o, --output`: Output mesh path. Default: `output/reconstructed_mesh.glb`
+- `--margin`: Grid boundary margin. Default: `0.05`
+- `--tri_mode`: Triangulation mode (`auto`, `length`, `angle`, `normal_abs`). Default: `auto`
 
-Use `python demo.py --help` to see all options.
-
-## Library API
-
-You can also import `faithcontour` directly into your own projects.
+### Library API
 
 ```python
 import torch
 import trimesh
-import faithcontour as fc
+from faithcontour import FCTEncoder, FCTDecoder, normalize_mesh
+from atom3d import MeshBVH
+from atom3d.grid import OctreeIndexer
 
 # --- Load and Normalize Mesh ---
-mesh = trimesh.load("my_model.obj")
-mesh = fc.normalize_mesh(mesh, rescalar=0.95)
+mesh = trimesh.load("my_model.obj", force='mesh')
+mesh = normalize_mesh(mesh, rescalar=0.95)
 
-V = torch.tensor(mesh.vertices, dtype=torch.float32)
-F = torch.tensor(mesh.faces, dtype=torch.long)
-N_F = torch.tensor(mesh.face_normals, dtype=torch.float32)
+V = torch.tensor(mesh.vertices, dtype=torch.float32, device='cuda')
+F = torch.tensor(mesh.faces, dtype=torch.long, device='cuda')
+
+# --- Build Spatial Structures ---
+bvh = MeshBVH(V, F, device='cuda')
+octree = OctreeIndexer(max_level=9, bounds=bvh.get_bounds(), device='cuda')  # 512^3
 
 # --- Encoding ---
-# Set parameters
-MAX_LEVEL = 9 # Corresponds to a 512^3 grid
-solver_weights = {'lambda_n': 1.0, 'lambda_d': 1e-3, 'area_power': 1.0}
-
-FCT_dict = fc.FCT_encoder(
-    vertices=V,
-    faces=F,
-    face_normals=N_F,
-    max_level=MAX_LEVEL,
-    solver_weights=solver_weights,
-    device='cuda',
-    output_mode='dict'
+encoder = FCTEncoder(bvh, octree, device='cuda')
+fct_result = encoder.encode(
+    min_level=4,
+    compute_flux=True,
+    clamp_anchors=True
 )
 
-# You can now save `active_indices` and `features` to disk.
+print(f"Active voxels: {fct_result.active_voxel_indices.shape[0]}")
+print(f"Anchor shape: {fct_result.anchor.shape}")
+print(f"Edge flux shape: {fct_result.edge_flux_sign.shape}")
 
 # --- Decoding ---
-resolution = 1 << MAX_LEVEL
-recon_points, recon_faces = fc.FCT_decoder(
-    FCT_dict
-    resolution=resolution
-)
+decoder = FCTDecoder(resolution=512, bounds=bvh.get_bounds(), device='cuda')
+mesh_result = decoder.decode_from_result(fct_result)
 
-# Create a trimesh object from the decoded data
-final_mesh = trimesh.Trimesh(recon_points.cpu().numpy(), recon_faces.cpu().numpy())
+# Export
+final_mesh = trimesh.Trimesh(
+    mesh_result.vertices.cpu().numpy(), 
+    mesh_result.faces.cpu().numpy()
+)
 final_mesh.export("reconstructed_mesh.glb")
 ```
 
+
 ## Roadmap
 
-- [x] Wheel Package for Linux (Python 3.10, CUDA 11.8) Release
-- [ ] Algorithm Code Release
+- [x] Wheel Package for Linux (v0.1)
+- [x] **Pure Python + Atom3d Implementation (v1.5)** ✨
 - [ ] Faithful Contour Tokens based VAE Release
 - [ ] Diffusion Model Release
+
 
 ## License
 
 Distributed under the Attribution-NonCommercial 4.0 International License. See `LICENSE` for more information.
 
+
 ## Citation
+
 If you find this project useful in your research, please consider citing:
 ```bibtex
 @misc{luo2025faithfulcontouringnearlossless3d,
@@ -210,9 +250,9 @@ If you find this project useful in your research, please consider citing:
 }
 ```
 
+
 ## Contact
 
 Yihao Luo - y.luo23@imperial.ac.uk
 
-Project Link: [https://github.com/Luo-Yihao/FaithC](https://github.com/Luo-Yihao/FaithC)
-
+Project Link: [https://github.com/Luo-Yihao/FC_dev](https://github.com/Luo-Yihao/FC_dev)

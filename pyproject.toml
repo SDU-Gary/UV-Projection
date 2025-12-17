@@ -1,0 +1,45 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faithcontour"
+version = "1.5.0"
+authors = [
+    {name = "Yihao Luo"},
+]
+description = "Faithful Contour Token library for mesh encoding/decoding, built on Atom3d."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "trimesh",
+    "numpy",
+    "scipy",
+    "torch_scatter",
+    "einops",
+    "atom3d",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Luo-Yihao/FaithContour"
+"Bug Tracker" = "https://github.com/Luo-Yihao/FaithContour/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

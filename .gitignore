@@ -1,6 +1,4 @@
-src/faithcontour.egg-info/*
-src/faithcontour.egg-info
-src/faithcontour/*
+
 
 build
 build/*
@@ -12,3 +10,4 @@ assets/*.glb
 assets/*.ply
 assets/*.stl
 *.so
+src/faithcontour.egg-info/*
