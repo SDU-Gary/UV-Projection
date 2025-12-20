@@ -151,10 +151,12 @@ class FCTDecoder:
         quads_flux = edge_flux[valid_edge_ids]    # [Q]
         
         # Orient quads based on flux direction
+        # edge_incident_cubes returns CW order (original/backward compatible)
+        # Flip for positive flux to align normals correctly
         quads_oriented = torch.where(
-            quads_flux[:, None] > 0,
-            quads_local.flip(dims=[1]),  # Flip for positive flux
-            quads_local
+            quads_flux[:, None] > 0,  # Negative flux (edge opposes surface) → flip to make normal outward
+            quads_local.flip(dims=[1]),
+            quads_local                  # Negative flux → keep
         )
         
         # Step 5: Get unique vertices used

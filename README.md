@@ -146,7 +146,7 @@ pip install trimesh scipy einops
 # Clone and install FaithContour
 git clone https://github.com/Luo-Yihao/FC_dev.git
 cd FC_dev
-pip install -e .
+pip install -e . --no-build-isolation 
 ```
 
 **Requirements**:

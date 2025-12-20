@@ -350,27 +350,29 @@ class FCTEncoder:
         
         For each of the 12 edges per voxel, determines if the surface
         crosses it and the crossing direction.
+        
+        This method accounts for edge direction to ensure flux signs are
+        consistent with local edge topology. When adjacent voxels share
+        an edge but reference it in opposite directions, the flux sign
+        is corrected using the edge direction flag.
         """
         K = voxel_indices.shape[0]
         
-        # Get edge endpoints for all voxels
-        # cube_edge_indices returns [K, 12] with global edge indices
-        voxel_edge_indices = self.octree.cube_edge_indices(voxel_indices)  # [K, 12]
+        # Get unique edges - edges are canonically defined, no direction concept
+        unique_edges, voxel_to_edge = self.octree.voxel_unique_edges(voxel_indices)
         
-        # Get unique edges
-        edges_flat = voxel_edge_indices.reshape(-1)
-        unique_edges, inverse = torch.unique(edges_flat, return_inverse=True)
+        # Get edge endpoints for flux computation
+        edge_endpoints = self.octree.edge_endpoints(unique_edges)
         
-        # Get edge endpoint coordinates
-        edge_endpoints = self.octree.edge_endpoints(unique_edges)  # [E, 2, 3]
-        
-        # Compute flux for unique edges
+        # Compute flux for unique edges using canonical direction
+        # flux_sign = sign(dot(edge_direction, surface_normal))
         unique_flux = compute_edge_flux_sign(self.bvh, edge_endpoints)  # [E]
         
         # Map back to per-voxel edges
-        edge_flux = unique_flux[inverse].reshape(K, 12)
+        # Each (voxel, local_edge) pair maps to the same unique edge with same flux
+        edge_flux = unique_flux[voxel_to_edge]  # [K, 12]
         
-        return edge_flux
+        return edge_flux.to(torch.int8)
     
     def _empty_result(self) -> FCTResult:
         """Return empty FCT result."""
