@@ -5,3 +5,6 @@ scipy
 torch_scatter
 einops
 atom3d
+PyYAML
+mitsuba
+drjit

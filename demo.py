@@ -202,7 +202,7 @@ def main():
     print(f"\n🔧 Building spatial structures...")
     
     time_start = time.time()
-    bvh = MeshBVH(vertices, faces)
+    bvh = MeshBVH(vertices, faces, device=device)
     time_bvh = time.time() - time_start
     print(f"   • MeshBVH built in {time_bvh:.3f}s")
     

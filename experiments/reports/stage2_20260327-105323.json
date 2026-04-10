@@ -1,0 +1,136 @@
+{
+  "hard_samples": [
+    "massive_cliff"
+  ],
+  "baseline": {
+    "run_id": "s1legacy-massive-r128-20260327-104555",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage1_legacy_r128.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.8524723413863174,
+        "uv_color_reproj_l1": 0.10035914927721024,
+        "uv_color_reproj_l2": 0.13161325454711914,
+        "uv_flip_ratio": 0.8384962745540754,
+        "uv_solver_stage": null,
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.8524723413863174,
+      "uv_color_reproj_l1": 0.10035914927721024,
+      "uv_color_reproj_l2": 0.13161325454711914,
+      "uv_flip_ratio": 0.8384962745540754
+    },
+    "hard_flip_mean": 0.8384962745540754
+  },
+  "method2": {
+    "run_id": "s2m2-massive-r128-20260327-104808",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage2_method2_r128.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5692255588168887,
+        "uv_color_reproj_l1": 0.11349162459373474,
+        "uv_color_reproj_l2": 0.14582917094230652,
+        "uv_flip_ratio": 0.5579701964326033,
+        "uv_solver_stage": "m2",
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.5692255588168887,
+      "uv_color_reproj_l1": 0.11349162459373474,
+      "uv_color_reproj_l2": 0.14582917094230652,
+      "uv_flip_ratio": 0.5579701964326033
+    },
+    "hard_flip_mean": 0.5579701964326033
+  },
+  "method4": {
+    "run_id": "s2m4-massive-r128-20260327-105044",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage2_method4_r128.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5694174757281554,
+        "uv_color_reproj_l1": 0.113922618329525,
+        "uv_color_reproj_l2": 0.14610618352890015,
+        "uv_flip_ratio": 0.5579814856626778,
+        "uv_solver_stage": "m2_fallback_after_m4",
+        "uv_m4_refine_status": "fallback_to_m2_injective_failed"
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.5694174757281554,
+      "uv_color_reproj_l1": 0.113922618329525,
+      "uv_color_reproj_l2": 0.14610618352890015,
+      "uv_flip_ratio": 0.5579814856626778
+    },
+    "hard_flip_mean": 0.5579814856626778
+  },
+  "gate_method2": {
+    "candidate_run_id": "s2m2-massive-r128-20260327-104808",
+    "baseline_run_id": "s1legacy-massive-r128-20260327-104555",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": 0.33226507045237835,
+    "uv_color_reproj_l1_improvement": -0.1308547891358686,
+    "candidate_hard_flip_mean": 0.5579701964326033,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": true,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "gate_method4": {
+    "candidate_run_id": "s2m4-massive-r128-20260327-105044",
+    "baseline_run_id": "s1legacy-massive-r128-20260327-104555",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": 0.3320399406716813,
+    "uv_color_reproj_l1_improvement": -0.1351493027790619,
+    "candidate_hard_flip_mean": 0.5579814856626778,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": true,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "stage2_any_passed": false,
+  "per_sample": [
+    {
+      "sample_name": "massive_cliff",
+      "baseline_bad_tri": 0.8524723413863174,
+      "method2_bad_tri": 0.5692255588168887,
+      "method4_bad_tri": 0.5694174757281554,
+      "baseline_l1": 0.10035914927721024,
+      "method2_l1": 0.11349162459373474,
+      "method4_l1": 0.113922618329525,
+      "baseline_flip": 0.8384962745540754,
+      "method2_flip": 0.5579701964326033,
+      "method4_flip": 0.5579814856626778,
+      "baseline_status": "success",
+      "method2_status": "success",
+      "method4_status": "success",
+      "method4_stage": "m2_fallback_after_m4",
+      "method4_refine_status": "fallback_to_m2_injective_failed"
+    }
+  ]
+}

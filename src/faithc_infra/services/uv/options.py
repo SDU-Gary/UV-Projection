@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import json
+from typing import Any, Dict
+
+METHOD_ALIASES = {
+    "nearest": "nearest_vertex",
+    "nearest_vertex": "nearest_vertex",
+    "barycentric": "barycentric_closest_point",
+    "barycentric_closest_point": "barycentric_closest_point",
+    "hybrid": "hybrid_global_opt",
+    "hybrid_global_opt": "hybrid_global_opt",
+    "method2": "method2_gradient_poisson",
+    "gradient_poisson": "method2_gradient_poisson",
+    "method2_gradient_poisson": "method2_gradient_poisson",
+    "method4": "method4_jacobian_injective",
+    "jacobian_injective": "method4_jacobian_injective",
+    "method4_jacobian_injective": "method4_jacobian_injective",
+    # Keep auto mapped to Method2 as the maintained default path.
+    "auto": "method2_gradient_poisson",
+}
+
+DEFAULT_OPTIONS: Dict[str, Any] = {
+    "sample": {
+        "base_per_face": 4,
+        "min_per_face": 3,
+        "max_per_face": 12,
+        "seed": 12345,
+    },
+    "correspondence": {
+        "normal_weight": 0.2,
+        "normal_dot_min": 0.7,
+        "ray_max_dist_ratio": 0.08,
+        "fallback_k": 8,
+        "fallback_weight": 0.7,
+        "bvh_chunk_size": 200000,
+    },
+    "solve": {
+        "backend": "auto",
+        "lambda_smooth": 2e-4,
+        "pcg_max_iter": 2000,
+        "pcg_tol": 1e-6,
+        "pcg_check_every": 25,
+        "pcg_preconditioner": "jacobi",
+        # Legacy aliases kept for backward compatibility.
+        "cg_max_iter": 2000,
+        "cg_tol": 1e-6,
+        "anchor_weight": 1e2,
+        "ridge_eps": 1e-8,
+    },
+    "seam": {
+        "strategy": "legacy",
+        "uv_span_threshold": 0.35,
+        "min_valid_samples_per_face": 2,
+        "exclude_cross_seam_faces": True,
+        "local_vertex_split": True,
+        "high_position_eps": 1e-6,
+        "high_uv_eps": 1e-5,
+        # Dijkstra seam routing (used when strategy=halfedge_island).
+        "routing_weight_dist": 3.0,
+        "routing_weight_align": 1.5,
+        "routing_weight_length": 1.0,
+        "routing_weight_dihedral": 0.25,
+        "routing_knn_segments": 8,
+        # Per-chain local attraction (on top of global seam attraction) to avoid
+        # multiple high-seam chains collapsing onto identical low edges.
+        "routing_chain_local_scale": 1.5,
+        "routing_chain_weight_dist": 3.0,
+        "routing_chain_weight_align": 1.5,
+        "routing_chain_knn_segments": 8,
+        # Penalize reusing routed low edges across chains.
+        "routing_edge_reuse_penalty": 2.0,
+        "routing_edge_reuse_power": 1.0,
+        "routing_anchor_spacing_ratio": 8.0,
+        "routing_min_anchors": 8,
+        "routing_max_anchors": 128,
+        "routing_island_confidence_min": 0.55,
+        # Guard correspondence against cross-island matches before global UV solve.
+        "uv_island_guard_enabled": True,
+        "uv_island_guard_mode": "soft",
+        "uv_island_guard_confidence_min": 0.55,
+        "uv_island_guard_allow_unknown": False,
+        "uv_island_guard_fallback": "nearest_same_island_then_udf",
+    },
+    "iterative": {
+        "enabled": True,
+        "min_iters": 2,
+        "max_iters": 4,
+        "strict_mode_from_iter": 2,
+        "label_change_tol": 0.02,
+        "energy_rel_tol": 1e-3,
+        "patience": 1,
+        "unknown_face_policy": "exclude",
+    },
+    "texture_weight": {
+        "enabled": True,
+        "grad_weight_gamma": 1.0,
+        "max_weight": 5.0,
+    },
+    "method2": {
+        "outlier_sigma": 4.0,
+        "outlier_quantile": 0.95,
+        "min_samples_per_face": 2,
+        "face_weight_floor": 1e-6,
+        "use_island_guard": False,
+        "adaptive_anchor_enabled": True,
+        "anchor_mode": "component_minimal",
+        "anchor_points_per_component": 4,
+        "anchor_min_points_per_component": 3,
+        "anchor_max_points_per_component": 5,
+        "anchor_target_vertices_per_anchor": 8000,
+        "anchor_confidence_floor": 0.2,
+        "anchor_confidence_power": 1.0,
+        "anchor_boundary_boost": 0.5,
+        "anchor_curvature_boost": 0.5,
+        "hard_anchor_enabled": False,
+        "hard_anchor_conf_min": 0.85,
+        "hard_anchor_min_per_component": 2,
+        "hard_anchor_max_per_component": 4,
+        "irls_iters": 2,
+        "huber_delta": 3.0,
+        "post_align_translation": True,
+        "post_align_min_samples": 64,
+        "post_align_max_shift": 0.25,
+        "adaptive_smooth_enabled": True,
+        "adaptive_smooth_beta": 2.0,
+        "adaptive_smooth_min_alpha": 0.25,
+        "adaptive_smooth_max_alpha": 1.5,
+        "laplacian_mode": "cotan",
+        "system_cond_estimate": "diag_ratio",
+        "emit_face_sample_counts": False,
+        "solve_per_island": True,
+        "perf_fast_island_cache": True,
+        "perf_fast_agg_vectorized": True,
+        "perf_fast_small_group_threshold": 6,
+        "perf_fast_small_group_skip_irls": True,
+        "perf_fast_small_group_skip_outlier": True,
+        "perf_fast_cut_edge_count": True,
+    },
+    "method4": {
+        "enabled": True,
+        "device": "auto",
+        "optimizer": "lbfgs",
+        "max_iters": 120,
+        "lr": 0.25,
+        "jacobian_weight": 1.0,
+        "smooth_weight": 1e-6,
+        "sym_dirichlet_weight": 2e-2,
+        "logdet_barrier_weight": 1e-2,
+        "flip_barrier_weight": 5e-2,
+        "barrier_weight": 0.0,
+        "anchor_weight": 5e-4,
+        "det_eps": 1e-7,
+        "det_softplus_beta": 40.0,
+        "area_eps": 1e-10,
+        "grad_clip": 5.0,
+        "early_stop_rel_tol": 1e-5,
+        "early_stop_patience": 10,
+        "max_line_search_fail": 16,
+        "line_search_alpha": 0.5,
+        "line_search_c1": 1e-4,
+        "patch_refine_rounds": 3,
+        "patch_refine_steps": 80,
+        "patch_refine_lr": 0.05,
+        "pre_repair_enabled": True,
+        "pre_repair_iters": 8,
+        "pre_repair_step": 0.25,
+        "fallback_to_method2_on_violation": True,
+        "fallback_violation_ratio_tol": 0.02,
+        "fallback_violation_count_tol": 8,
+        "barrier_homotopy_enabled": True,
+        "barrier_homotopy_warmup_iters": 40,
+    },
+}
+
+
+def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(base))
+    stack = [(out, override)]
+    while stack:
+        dst, src = stack.pop()
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                stack.append((dst[key], value))
+            else:
+                dst[key] = value
+    return out

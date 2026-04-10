@@ -1,13 +1,39 @@
 
+# Build artifacts
+build/
+viewer/opengl_previewer/build/
+viewer/opengl_previewer/build/**
+dist/
+*.so
 
-build
-build/*
+# Python artifacts
 *.pyc
+__pycache__/
+src/faithcontour.egg-info/
+src/*.egg-info/
 
-output/*
+# Experiment infra outputs
+output/
+experiments/runs/
+renderer/**/outputs/
+*.perf.json
+*.perf.txt
+
+# Local IDE/runtime state
+.vscode/
+.idea/
+imgui.ini
+
+# Local raw assets (curated examples stay under assets/examples/)
 assets/*.obj
 assets/*.glb
 assets/*.ply
 assets/*.stl
-*.so
-src/faithcontour.egg-info/*
+assets/*.fbx
+assets/*.zip
+
+# Local scratch files
+/1
+/开题.pdf
+/hybrid_*.png
+/source_rock.png

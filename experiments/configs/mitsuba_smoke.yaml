@@ -1,0 +1,39 @@
+project:
+  name: faithc-mitsuba-smoke
+  run_prefix: mitsuba-smoke
+
+paths:
+  runs_dir: experiments/runs
+
+data:
+  samples:
+    - name: pirateship
+      high_mesh: assets/examples/pirateship.glb
+
+pipeline:
+  device: cuda
+
+  reconstruction:
+    enabled: true
+    resolution: 128
+    margin: 0.05
+    tri_mode: auto
+    compute_flux: true
+    clamp_anchors: true
+    save_tokens: true
+
+  uv:
+    enabled: false
+    method: nearest_vertex
+
+  eval:
+    enabled: false
+    sample_points: 2000
+
+  render:
+    enabled: true
+    backend: mitsuba3
+    preset: default
+    variant: cuda_ad_rgb
+    samples_per_pixel: 64
+    preset_path: renderer/mitsuba3/presets/default.yaml

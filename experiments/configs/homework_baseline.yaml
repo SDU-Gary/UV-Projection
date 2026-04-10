@@ -1,0 +1,96 @@
+project:
+  name: faithc-uv-homework
+  run_prefix: hw
+
+paths:
+  runs_dir: experiments/runs
+
+data:
+  samples:
+    - name: pirateship
+      high_mesh: assets/examples/pirateship.glb
+    - name: cloth
+      high_mesh: assets/examples/cloth.glb
+    - name: light_bulb
+      high_mesh: assets/examples/light_bulb.glb
+    - name: corgi_traveller
+      high_mesh: assets/examples/corgi_traveller.glb
+
+pipeline:
+  device: cuda
+
+  reconstruction:
+    enabled: true
+    resolution: 8
+    margin: 0.05
+    tri_mode: auto
+    compute_flux: true
+    clamp_anchors: true
+    save_tokens: true
+    retry_on_empty_mesh: true
+    retry_resolutions: [16, 32, 64, 128]
+    min_level: -1
+    solver_weights:
+      lambda_n: 1.0
+      lambda_d: 0.001
+      weight_power: 1
+
+  uv:
+    enabled: true
+    method: hybrid_global_opt
+    sample:
+      base_per_face: 4
+      min_per_face: 3
+      max_per_face: 12
+      seed: 12345
+    correspondence:
+      normal_weight: 0.2
+      normal_dot_min: 0.7
+      ray_max_dist_ratio: 0.08
+      fallback_k: 8
+      fallback_weight: 0.7
+      bvh_chunk_size: 200000
+    seam:
+      strategy: legacy
+      uv_span_threshold: 0.35
+      min_valid_samples_per_face: 2
+      exclude_cross_seam_faces: true
+      local_vertex_split: true
+      high_position_eps: 1.0e-06
+      high_uv_eps: 1.0e-05
+    iterative:
+      enabled: true
+      min_iters: 2
+      max_iters: 4
+      strict_mode_from_iter: 2
+      label_change_tol: 0.02
+      energy_rel_tol: 0.001
+      patience: 1
+      unknown_face_policy: exclude
+    solve:
+      backend: auto
+      lambda_smooth: 0.001
+      pcg_max_iter: 2000
+      pcg_tol: 1.0e-06
+      pcg_check_every: 25
+      pcg_preconditioner: jacobi
+      cg_max_iter: 2000
+      cg_tol: 1.0e-06
+      anchor_weight: 0.1
+      ridge_eps: 1.0e-08
+    texture_weight:
+      enabled: true
+      grad_weight_gamma: 1.0
+      max_weight: 5.0
+
+  eval:
+    enabled: true
+    sample_points: 10000
+
+  render:
+    enabled: false
+    backend: mitsuba3
+    preset: default
+    variant: cuda_ad_rgb
+    samples_per_pixel: 64
+    preset_path: ""

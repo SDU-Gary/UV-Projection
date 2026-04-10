@@ -1,0 +1,115 @@
+project:
+  name: faithc-uv-stage2-method2
+  run_prefix: uv-s2-m2
+
+paths:
+  runs_dir: experiments/runs
+
+data:
+  samples:
+    - name: corgi_traveller
+      high_mesh: assets/examples/corgi_traveller.glb
+    - name: aksfbx
+      high_mesh: assets/aksfbx.glb
+    - name: rotarycannon
+      high_mesh: assets/rotarycannonfbx.glb
+
+pipeline:
+  device: cuda
+
+  reconstruction:
+    enabled: true
+    resolution: 8
+    margin: 0.05
+    tri_mode: auto
+    compute_flux: true
+    clamp_anchors: true
+    save_tokens: true
+    retry_on_empty_mesh: true
+    retry_resolutions: [16, 32, 64, 128]
+    min_level: -1
+    solver_weights:
+      lambda_n: 1.0
+      lambda_d: 0.001
+      weight_power: 1
+
+  uv:
+    enabled: true
+    method: method2_gradient_poisson
+    sample:
+      base_per_face: 4
+      min_per_face: 3
+      max_per_face: 12
+      seed: 12345
+    seam:
+      strategy: halfedge_island
+      uv_span_threshold: 0.35
+      min_valid_samples_per_face: 2
+      exclude_cross_seam_faces: true
+      local_vertex_split: true
+      high_position_eps: 1.0e-06
+      high_uv_eps: 1.0e-05
+    correspondence:
+      normal_weight: 0.2
+      normal_dot_min: 0.7
+      ray_max_dist_ratio: 0.08
+      fallback_k: 8
+      fallback_weight: 0.7
+      bvh_chunk_size: 200000
+    solve:
+      backend: auto
+      lambda_smooth: 0.0002
+      pcg_max_iter: 2000
+      pcg_tol: 1.0e-06
+      pcg_check_every: 25
+      pcg_preconditioner: jacobi
+      anchor_weight: 1.0e+02
+      ridge_eps: 1.0e-08
+    texture_weight:
+      enabled: true
+      grad_weight_gamma: 1.0
+      max_weight: 5.0
+    method2:
+      outlier_sigma: 4.0
+      outlier_quantile: 0.95
+      min_samples_per_face: 2
+      face_weight_floor: 1.0e-06
+      use_island_guard: false
+      adaptive_anchor_enabled: true
+      anchor_mode: component_minimal
+      anchor_points_per_component: 4
+      anchor_min_points_per_component: 3
+      anchor_max_points_per_component: 5
+      anchor_target_vertices_per_anchor: 8000
+      anchor_confidence_floor: 0.2
+      anchor_confidence_power: 1.0
+      anchor_boundary_boost: 0.5
+      anchor_curvature_boost: 0.5
+      hard_anchor_enabled: false
+      hard_anchor_conf_min: 0.85
+      hard_anchor_min_per_component: 2
+      hard_anchor_max_per_component: 4
+      irls_iters: 2
+      huber_delta: 3.0
+      post_align_translation: true
+      post_align_min_samples: 64
+      post_align_max_shift: 0.25
+      adaptive_smooth_enabled: true
+      adaptive_smooth_beta: 2.0
+      adaptive_smooth_min_alpha: 0.25
+      adaptive_smooth_max_alpha: 1.5
+      laplacian_mode: cotan
+      system_cond_estimate: diag_ratio
+      solve_per_island: true
+
+  eval:
+    enabled: true
+    sample_points: 10000
+
+  render:
+    enabled: false
+    backend: mitsuba3
+    preset: default
+    variant: cuda_ad_rgb
+    samples_per_pixel: 64
+    preset_path: ""

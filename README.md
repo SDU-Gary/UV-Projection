@@ -221,6 +221,93 @@ final_mesh = trimesh.Trimesh(
 final_mesh.export("reconstructed_mesh.glb")
 ```
 
+## Experiment Infra (Homework + Research)
+
+This repository now includes a reusable experiment infrastructure for:
+- batch reconstruction with FaithC,
+- nearest-point UV baseline projection,
+- metric evaluation and run tracking,
+- Mitsuba3-oriented render manifest generation.
+
+Quick start:
+
+```bash
+# install (editable mode recommended)
+pip install -e . --no-build-isolation
+
+# run a baseline experiment set
+faithc-exp run -c experiments/configs/homework_baseline.yaml
+
+# recompute metrics for a run
+faithc-exp eval -r <run_id>
+
+# trigger Mitsuba3 rendering pass for a run
+faithc-exp render -r <run_id>
+
+# launch OpenGL interactive previewer
+faithc-exp preview --mesh assets/examples/pirateship.glb
+```
+
+Outputs are grouped by run under `experiments/runs/<run_id>/`, with
+`run_meta.json`, `run_index.json`, `summary.csv`, and per-sample artifacts.
+
+### Built-in Profiler (Default On)
+
+`faithc-exp run` and preview pipeline runs now include a built-in profiler by default.
+
+- CLI run reports: `experiments/runs/<run_id>/perf/run_profile.json|txt`
+- Preview launcher reports: `<work_dir>/perf/preview_launcher_<timestamp>.json|txt`
+- Preview bridge reports (per projection job): `<status_json_stem>.perf.json|txt`
+
+Profiler covers common diagnostics:
+- wall time / CPU time
+- stage timing breakdown (top stages, avg/max per stage)
+- hotspot functions (`cProfile`, cumulative + self time)
+- memory stats (`tracemalloc`, `ru_maxrss`)
+- CUDA device/memory stats when CUDA is available
+
+Optional flags:
+- `--no-profile`: disable profiler
+- `--profile-top-k N`: control hotspot rows
+- `--profile-no-cprofile`: keep stage/memory metrics, skip cProfile hotspots
+
+### UV Research Methods (Current Focus)
+
+当前代码库优先维护两条 UV 研究路径：
+
+1. `method2_gradient_poisson`
+2. `method4_jacobian_injective`
+
+实现文档：
+
+1. `docs/uv/README.md`
+2. `docs/uv/method2_implementation.md`
+3. `docs/uv/method4_implementation.md`
+
+Mitsuba3 integration:
+
+```bash
+# install Mitsuba3 into the faithc environment
+conda activate faithc
+pip install mitsuba drjit
+
+# run render pass (backend defaults to mitsuba3)
+cd /path/to/FaithC
+faithc-exp render -r <run_id>
+```
+
+OpenGL interactive previewer (C++):
+
+```bash
+cd viewer/opengl_previewer
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# launch via CLI wrapper
+cd /path/to/FaithC
+faithc-exp preview --mesh assets/examples/pirateship.glb
+```
+
 
 ## Roadmap
 

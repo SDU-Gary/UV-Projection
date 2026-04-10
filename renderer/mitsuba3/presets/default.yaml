@@ -1,0 +1,25 @@
+name: default
+
+sensor:
+  eye: [2.2, 1.8, 2.2]
+  target: [0.0, 0.0, 0.0]
+  up: [0.0, 1.0, 0.0]
+  fov: 45.0
+
+render:
+  width: 1280
+  height: 720
+
+integrator:
+  type: path
+  max_depth: 8
+
+emitter:
+  type: constant
+  radiance: 1.0
+
+bsdf:
+  type: diffuse
+  reflectance:
+    type: rgb
+    value: [0.7, 0.7, 0.7]

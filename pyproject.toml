@@ -32,7 +32,13 @@ dependencies = [
     "torch_scatter",
     "einops",
     "atom3d",
+    "PyYAML",
+    "mitsuba",
+    "drjit",
 ]
+
+[project.scripts]
+faithc-exp = "faithc_infra.cli:main"
 
 [project.urls]
 "Homepage" = "https://github.com/Luo-Yihao/FaithContour"

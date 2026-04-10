@@ -1,0 +1,226 @@
+{
+  "hard_samples": [
+    "aksfbx",
+    "rotarycannon",
+    "massive_nordic_coastal_cliff_vdssailfa_raw"
+  ],
+  "baseline": {
+    "run_id": "uv-s1-legacy-20260326-202633",
+    "config_path": "/home/kyrie/FaithC/experiments/configs/uv_stage1_legacy_once.yaml",
+    "total_samples": 3,
+    "success_samples": 3,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "corgi_traveller": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5,
+        "uv_color_reproj_l1": 0.10569413006305695,
+        "uv_color_reproj_l2": 0.16806277632713318,
+        "uv_flip_ratio": 0.49609375,
+        "uv_solver_stage": null,
+        "uv_m4_refine_status": null
+      },
+      "aksfbx": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.4166666666666667,
+        "uv_color_reproj_l1": 0.11685281991958618,
+        "uv_color_reproj_l2": 0.1646672934293747,
+        "uv_flip_ratio": 0.375,
+        "uv_solver_stage": null,
+        "uv_m4_refine_status": null
+      },
+      "rotarycannon": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.4411764705882353,
+        "uv_color_reproj_l1": 0.02560690976679325,
+        "uv_color_reproj_l2": 0.0477989986538887,
+        "uv_flip_ratio": 0.4411764705882353,
+        "uv_solver_stage": null,
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.4526143790849673,
+      "uv_color_reproj_l1": 0.08271795324981213,
+      "uv_color_reproj_l2": 0.12684302280346552,
+      "uv_flip_ratio": 0.4374234068627451
+    },
+    "hard_flip_mean": 0.40808823529411764
+  },
+  "method2": {
+    "run_id": "uv-s2-m2-20260326-235320",
+    "config_path": "/home/kyrie/FaithC/experiments/configs/uv_stage2_method2.yaml",
+    "total_samples": 3,
+    "success_samples": 3,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "corgi_traveller": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.4765625,
+        "uv_color_reproj_l1": 0.1624823957681656,
+        "uv_color_reproj_l2": 0.23065127432346344,
+        "uv_flip_ratio": 0.47265625,
+        "uv_solver_stage": "m2",
+        "uv_m4_refine_status": null
+      },
+      "aksfbx": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5,
+        "uv_color_reproj_l1": 0.14830276370048523,
+        "uv_color_reproj_l2": 0.21499592065811157,
+        "uv_flip_ratio": 0.4583333333333333,
+        "uv_solver_stage": "m2",
+        "uv_m4_refine_status": null
+      },
+      "rotarycannon": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5,
+        "uv_color_reproj_l1": 0.045138053596019745,
+        "uv_color_reproj_l2": 0.06551189720630646,
+        "uv_flip_ratio": 0.5,
+        "uv_solver_stage": "m2",
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.4921875,
+      "uv_color_reproj_l1": 0.11864107102155685,
+      "uv_color_reproj_l2": 0.17038636406262717,
+      "uv_flip_ratio": 0.4769965277777778
+    },
+    "hard_flip_mean": 0.47916666666666663
+  },
+  "method4": {
+    "run_id": "uv-s2-m4-20260326-235436",
+    "config_path": "/home/kyrie/FaithC/experiments/configs/uv_stage2_method4.yaml",
+    "total_samples": 3,
+    "success_samples": 3,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "corgi_traveller": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.46875,
+        "uv_color_reproj_l1": 0.16314437985420227,
+        "uv_color_reproj_l2": 0.23268838226795197,
+        "uv_flip_ratio": 0.46484375,
+        "uv_solver_stage": "m2_fallback_after_m4",
+        "uv_m4_refine_status": "fallback_to_m2_injective_failed"
+      },
+      "aksfbx": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5,
+        "uv_color_reproj_l1": 0.1446751356124878,
+        "uv_color_reproj_l2": 0.21073447167873383,
+        "uv_flip_ratio": 0.4583333333333333,
+        "uv_solver_stage": "m2_fallback_after_m4",
+        "uv_m4_refine_status": "fallback_to_m2_injective_failed"
+      },
+      "rotarycannon": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.47058823529411764,
+        "uv_color_reproj_l1": 0.043393563479185104,
+        "uv_color_reproj_l2": 0.06417457014322281,
+        "uv_flip_ratio": 0.47058823529411764,
+        "uv_solver_stage": "m2_fallback_after_m4",
+        "uv_m4_refine_status": "fallback_to_m2_injective_failed"
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.4797794117647059,
+      "uv_color_reproj_l1": 0.11707102631529172,
+      "uv_color_reproj_l2": 0.16919914136330286,
+      "uv_flip_ratio": 0.46458843954248363
+    },
+    "hard_flip_mean": 0.4644607843137255
+  },
+  "gate_method2": {
+    "candidate_run_id": "uv-s2-m2-20260326-235320",
+    "baseline_run_id": "uv-s1-legacy-20260326-202633",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": -0.08743231046931407,
+    "uv_color_reproj_l1_improvement": -0.43428441300107146,
+    "candidate_hard_flip_mean": 0.47916666666666663,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": false,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "gate_method4": {
+    "candidate_run_id": "uv-s2-m4-20260326-235436",
+    "baseline_run_id": "uv-s1-legacy-20260326-202633",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": -0.06001805054151628,
+    "uv_color_reproj_l1_improvement": -0.41530371238431985,
+    "candidate_hard_flip_mean": 0.4644607843137255,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": false,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "stage2_any_passed": false,
+  "per_sample": [
+    {
+      "sample_name": "aksfbx",
+      "baseline_bad_tri": 0.4166666666666667,
+      "method2_bad_tri": 0.5,
+      "method4_bad_tri": 0.5,
+      "baseline_l1": 0.11685281991958618,
+      "method2_l1": 0.14830276370048523,
+      "method4_l1": 0.1446751356124878,
+      "baseline_flip": 0.375,
+      "method2_flip": 0.4583333333333333,
+      "method4_flip": 0.4583333333333333,
+      "baseline_status": "success",
+      "method2_status": "success",
+      "method4_status": "success",
+      "method4_stage": "m2_fallback_after_m4",
+      "method4_refine_status": "fallback_to_m2_injective_failed"
+    },
+    {
+      "sample_name": "corgi_traveller",
+      "baseline_bad_tri": 0.5,
+      "method2_bad_tri": 0.4765625,
+      "method4_bad_tri": 0.46875,
+      "baseline_l1": 0.10569413006305695,
+      "method2_l1": 0.1624823957681656,
+      "method4_l1": 0.16314437985420227,
+      "baseline_flip": 0.49609375,
+      "method2_flip": 0.47265625,
+      "method4_flip": 0.46484375,
+      "baseline_status": "success",
+      "method2_status": "success",
+      "method4_status": "success",
+      "method4_stage": "m2_fallback_after_m4",
+      "method4_refine_status": "fallback_to_m2_injective_failed"
+    },
+    {
+      "sample_name": "rotarycannon",
+      "baseline_bad_tri": 0.4411764705882353,
+      "method2_bad_tri": 0.5,
+      "method4_bad_tri": 0.47058823529411764,
+      "baseline_l1": 0.02560690976679325,
+      "method2_l1": 0.045138053596019745,
+      "method4_l1": 0.043393563479185104,
+      "baseline_flip": 0.4411764705882353,
+      "method2_flip": 0.5,
+      "method4_flip": 0.47058823529411764,
+      "baseline_status": "success",
+      "method2_status": "success",
+      "method4_status": "success",
+      "method4_stage": "m2_fallback_after_m4",
+      "method4_refine_status": "fallback_to_m2_injective_failed"
+    }
+  ]
+}

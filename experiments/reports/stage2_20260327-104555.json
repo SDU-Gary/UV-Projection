@@ -1,0 +1,136 @@
+{
+  "hard_samples": [
+    "massive_cliff"
+  ],
+  "baseline": {
+    "run_id": "s1legacy-massive-r64-20260327-103909",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage1_legacy_r64.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.8209906343535773,
+        "uv_color_reproj_l1": 0.10004649311304092,
+        "uv_color_reproj_l2": 0.13146311044692993,
+        "uv_flip_ratio": 0.8076663126387951,
+        "uv_solver_stage": null,
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.8209906343535773,
+      "uv_color_reproj_l1": 0.10004649311304092,
+      "uv_color_reproj_l2": 0.13146311044692993,
+      "uv_flip_ratio": 0.8076663126387951
+    },
+    "hard_flip_mean": 0.8076663126387951
+  },
+  "method2": {
+    "run_id": "s2m2-massive-r64-20260327-104121",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage2_method2_r64.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5879598339287438,
+        "uv_color_reproj_l1": 0.11750475317239761,
+        "uv_color_reproj_l2": 0.14972054958343506,
+        "uv_flip_ratio": 0.5765182968040938,
+        "uv_solver_stage": "m2",
+        "uv_m4_refine_status": null
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.5879598339287438,
+      "uv_color_reproj_l1": 0.11750475317239761,
+      "uv_color_reproj_l2": 0.14972054958343506,
+      "uv_flip_ratio": 0.5765182968040938
+    },
+    "hard_flip_mean": 0.5765182968040938
+  },
+  "method4": {
+    "run_id": "s2m4-massive-r64-20260327-104337",
+    "config_path": "/tmp/faithc_uv_reset_20260327-103909/uv_stage2_method4_r64.yaml",
+    "total_samples": 1,
+    "success_samples": 1,
+    "success_rate": 1.0,
+    "sample_rows": {
+      "massive_cliff": {
+        "status": "success",
+        "uv_bad_tri_ratio": 0.5896495124070676,
+        "uv_color_reproj_l1": 0.11728775501251221,
+        "uv_color_reproj_l2": 0.14964646100997925,
+        "uv_flip_ratio": 0.5772907212513276,
+        "uv_solver_stage": "m2_fallback_after_m4",
+        "uv_m4_refine_status": "fallback_to_m2_injective_failed"
+      }
+    },
+    "metric_means": {
+      "uv_bad_tri_ratio": 0.5896495124070676,
+      "uv_color_reproj_l1": 0.11728775501251221,
+      "uv_color_reproj_l2": 0.14964646100997925,
+      "uv_flip_ratio": 0.5772907212513276
+    },
+    "hard_flip_mean": 0.5772907212513276
+  },
+  "gate_method2": {
+    "candidate_run_id": "s2m2-massive-r64-20260327-104121",
+    "baseline_run_id": "s1legacy-massive-r64-20260327-103909",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": 0.28384099729507234,
+    "uv_color_reproj_l1_improvement": -0.1745014694281276,
+    "candidate_hard_flip_mean": 0.5765182968040938,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": true,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "gate_method4": {
+    "candidate_run_id": "s2m4-massive-r64-20260327-104337",
+    "baseline_run_id": "s1legacy-massive-r64-20260327-103909",
+    "improve_threshold": 0.1,
+    "hard_flip_threshold": 0.05,
+    "candidate_success_rate": 1.0,
+    "baseline_success_rate": 1.0,
+    "uv_bad_tri_ratio_improvement": 0.2817829001528873,
+    "uv_color_reproj_l1_improvement": -0.17233249625242394,
+    "candidate_hard_flip_mean": 0.5772907212513276,
+    "checks": {
+      "success_rate_not_worse": true,
+      "bad_tri_improvement": true,
+      "color_l1_improvement": false,
+      "hard_flip_near_zero": false
+    },
+    "passed": false
+  },
+  "stage2_any_passed": false,
+  "per_sample": [
+    {
+      "sample_name": "massive_cliff",
+      "baseline_bad_tri": 0.8209906343535773,
+      "method2_bad_tri": 0.5879598339287438,
+      "method4_bad_tri": 0.5896495124070676,
+      "baseline_l1": 0.10004649311304092,
+      "method2_l1": 0.11750475317239761,
+      "method4_l1": 0.11728775501251221,
+      "baseline_flip": 0.8076663126387951,
+      "method2_flip": 0.5765182968040938,
+      "method4_flip": 0.5772907212513276,
+      "baseline_status": "success",
+      "method2_status": "success",
+      "method4_status": "success",
+      "method4_stage": "m2_fallback_after_m4",
+      "method4_refine_status": "fallback_to_m2_injective_failed"
+    }
+  ]
+}
