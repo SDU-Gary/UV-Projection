@@ -12,18 +12,23 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <execinfo.h>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -41,6 +46,64 @@ namespace {
 
 constexpr int kWindowWidth = 1600;
 constexpr int kWindowHeight = 950;
+constexpr size_t kSeamOverlayFaceLimit = 800000;
+
+const char *g_crash_stage = "startup";
+volatile sig_atomic_t g_crash_handling = 0;
+
+void SetCrashStage(const char *stage) {
+    g_crash_stage = (stage != nullptr) ? stage : "(null)";
+}
+
+void SafeWrite(int fd, const void *buf, size_t len) {
+    const ssize_t written = write(fd, buf, len);
+    (void)written;
+}
+
+void CrashSignalHandler(int sig) {
+    if (g_crash_handling != 0) {
+        _exit(128 + sig);
+    }
+    g_crash_handling = 1;
+
+    char header[512];
+    const int n = std::snprintf(
+        header,
+        sizeof(header),
+        "\n==== faithc_viewer crash ====\nsignal=%d\nstage=%s\n",
+        sig,
+        g_crash_stage != nullptr ? g_crash_stage : "(null)"
+    );
+    if (n > 0) {
+        SafeWrite(STDERR_FILENO, header, static_cast<size_t>(n));
+    }
+
+    void *frames[128];
+    const int frame_count = backtrace(frames, 128);
+    backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+
+    int fd = ::open("/tmp/faithc_viewer_crash.log", O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd >= 0) {
+        if (n > 0) {
+            SafeWrite(fd, header, static_cast<size_t>(n));
+        }
+        backtrace_symbols_fd(frames, frame_count, fd);
+        static const char newline = '\n';
+        SafeWrite(fd, &newline, 1);
+        close(fd);
+    }
+
+    std::signal(sig, SIG_DFL);
+    std::raise(sig);
+}
+
+void InstallCrashHandlers() {
+    std::signal(SIGSEGV, CrashSignalHandler);
+    std::signal(SIGABRT, CrashSignalHandler);
+    std::signal(SIGBUS, CrashSignalHandler);
+    std::signal(SIGILL, CrashSignalHandler);
+    std::signal(SIGFPE, CrashSignalHandler);
+}
 
 std::string ShellQuote(const std::string &value) {
     std::string out;
@@ -94,6 +157,21 @@ struct WeldEdgeKeyHash {
     }
 };
 
+struct TopoEdgeKey {
+    uint32_t a = 0;
+    uint32_t b = 0;
+
+    bool operator==(const TopoEdgeKey &other) const { return a == other.a && b == other.b; }
+};
+
+struct TopoEdgeKeyHash {
+    std::size_t operator()(const TopoEdgeKey &k) const noexcept {
+        const std::size_t h1 = std::hash<uint32_t>{}(k.a);
+        const std::size_t h2 = std::hash<uint32_t>{}(k.b);
+        return h1 ^ (h2 << 1U);
+    }
+};
+
 struct UVSeamOverlay {
     std::vector<glm::vec3> line_points;
     bool has_uv = false;
@@ -101,6 +179,25 @@ struct UVSeamOverlay {
     int boundary_edges = 0;
     int nonmanifold_edges = 0;
     int interior_seam_edges = 0;
+};
+
+struct ClosureValidationSummary {
+    bool available = false;
+    bool partition_has_leakage = false;
+    bool seam_topology_valid = false;
+    int partition_mixed_components = -1;
+    int partition_label_split_count = -1;
+    int seam_components = -1;
+    int seam_loops_closed = -1;
+    int seam_components_open = -1;
+    int low_island_count = -1;
+    int high_island_count = -1;
+    int semantic_unknown_faces = -1;
+    double uv_bbox_iou_mean = -1.0;
+    double uv_overlap_ratio = -1.0;
+    double uv_stretch_p95 = -1.0;
+    double uv_stretch_p99 = -1.0;
+    std::string uv_png_path;
 };
 
 struct EdgeRecord {
@@ -236,6 +333,174 @@ UVSeamOverlay BuildUVSeamOverlay(const faithc::viewer::MeshData &mesh, double po
     return out;
 }
 
+UVSeamOverlay BuildUVBoundaryAuditOverlay(
+    const faithc::viewer::MeshData &mesh,
+    double position_eps = 1e-6,
+    double uv_eps = 1e-5
+) {
+    UVSeamOverlay out;
+    out.has_uv = mesh.has_uv;
+    if (!mesh.has_uv || mesh.empty()) {
+        return out;
+    }
+
+    const size_t vertex_count = mesh.vertex_count();
+    const size_t face_count = mesh.face_count();
+    if (vertex_count == 0 || face_count == 0) {
+        return out;
+    }
+
+    const double pos_eps = std::max(position_eps, 1e-12);
+    const float uv_eps2 = static_cast<float>(std::max(uv_eps, 0.0) * std::max(uv_eps, 0.0));
+
+    std::vector<int64_t> weld_id(vertex_count, -1);
+    std::unordered_map<QuantizedPosKey, int64_t, QuantizedPosKeyHash> weld_map;
+    weld_map.reserve(vertex_count * 2);
+    int64_t next_weld = 0;
+    for (size_t vid = 0; vid < vertex_count; ++vid) {
+        const glm::vec3 p = ReadVertexPosition(mesh, vid);
+        const QuantizedPosKey key{
+            static_cast<int64_t>(std::llround(static_cast<double>(p.x) / pos_eps)),
+            static_cast<int64_t>(std::llround(static_cast<double>(p.y) / pos_eps)),
+            static_cast<int64_t>(std::llround(static_cast<double>(p.z) / pos_eps)),
+        };
+        auto it = weld_map.find(key);
+        if (it == weld_map.end()) {
+            const auto inserted = weld_map.emplace(key, next_weld);
+            it = inserted.first;
+            ++next_weld;
+        }
+        weld_id[vid] = it->second;
+    }
+
+    std::unordered_map<TopoEdgeKey, int, TopoEdgeKeyHash> topo_edge_count;
+    topo_edge_count.reserve(face_count * 3);
+    for (size_t f = 0; f < face_count; ++f) {
+        const size_t base = f * 3;
+        const uint32_t tri[3] = {mesh.indices[base + 0], mesh.indices[base + 1], mesh.indices[base + 2]};
+        for (int c = 0; c < 3; ++c) {
+            uint32_t va = tri[c];
+            uint32_t vb = tri[(c + 1) % 3];
+            if (va >= vertex_count || vb >= vertex_count) {
+                continue;
+            }
+            if (va > vb) {
+                std::swap(va, vb);
+            }
+            const TopoEdgeKey tk{va, vb};
+            topo_edge_count[tk] += 1;
+        }
+    }
+
+    std::unordered_map<WeldEdgeKey, std::vector<EdgeRecord>, WeldEdgeKeyHash> grouped_boundary_edges;
+    grouped_boundary_edges.reserve(face_count);
+    for (size_t f = 0; f < face_count; ++f) {
+        const size_t base = f * 3;
+        const uint32_t tri[3] = {mesh.indices[base + 0], mesh.indices[base + 1], mesh.indices[base + 2]};
+        for (int c = 0; c < 3; ++c) {
+            const uint32_t va = tri[c];
+            const uint32_t vb = tri[(c + 1) % 3];
+            if (va >= vertex_count || vb >= vertex_count) {
+                continue;
+            }
+
+            uint32_t ta = va;
+            uint32_t tb = vb;
+            if (ta > tb) {
+                std::swap(ta, tb);
+            }
+            const TopoEdgeKey tk{ta, tb};
+            const auto it_topo = topo_edge_count.find(tk);
+            if (it_topo == topo_edge_count.end() || it_topo->second != 1) {
+                continue;
+            }
+
+            int64_t ga = weld_id[va];
+            int64_t gb = weld_id[vb];
+            glm::vec2 uv_a = ReadVertexUV(mesh, va);
+            glm::vec2 uv_b = ReadVertexUV(mesh, vb);
+            glm::vec3 pos_a = ReadVertexPosition(mesh, va);
+            glm::vec3 pos_b = ReadVertexPosition(mesh, vb);
+            if (ga > gb) {
+                std::swap(ga, gb);
+                std::swap(uv_a, uv_b);
+                std::swap(pos_a, pos_b);
+            }
+
+            const WeldEdgeKey wk{ga, gb};
+            grouped_boundary_edges[wk].push_back(EdgeRecord{
+                static_cast<int>(f),
+                uv_a,
+                uv_b,
+                pos_a,
+                pos_b,
+            });
+        }
+    }
+
+    auto add_seam = [&](const EdgeRecord &rec) {
+        out.line_points.push_back(rec.pos_a);
+        out.line_points.push_back(rec.pos_b);
+        out.seam_edges += 1;
+        out.interior_seam_edges += 1;
+    };
+
+    for (const auto &kv : grouped_boundary_edges) {
+        const std::vector<EdgeRecord> &records = kv.second;
+        if (records.empty()) {
+            continue;
+        }
+        if (records.size() == 1) {
+            // True mesh boundary: not an internal UV seam.
+            out.boundary_edges += 1;
+            continue;
+        }
+        if (records.size() > 2) {
+            out.nonmanifold_edges += 1;
+        }
+
+        bool seam = false;
+        const EdgeRecord &ref = records[0];
+        for (size_t i = 1; i < records.size(); ++i) {
+            const EdgeRecord &cur = records[i];
+            const glm::vec2 d_a = ref.uv_a - cur.uv_a;
+            const glm::vec2 d_b = ref.uv_b - cur.uv_b;
+            const bool same_a = glm::dot(d_a, d_a) <= uv_eps2;
+            const bool same_b = glm::dot(d_b, d_b) <= uv_eps2;
+            if (!(same_a && same_b)) {
+                seam = true;
+                break;
+            }
+        }
+        if (seam) {
+            add_seam(ref);
+        }
+    }
+
+    return out;
+}
+
+glm::vec3 EdgeHeatmapColor(float t) {
+    const float x = std::clamp(t, 0.0f, 1.0f);
+    if (x < 0.5f) {
+        const float k = x / 0.5f;
+        return glm::vec3(0.08f + 0.92f * k, 0.90f + 0.08f * (1.0f - k), 0.10f);
+    }
+    const float k = (x - 0.5f) / 0.5f;
+    return glm::vec3(1.0f, 0.95f - 0.80f * k, 0.10f);
+}
+
+float LabelToDeterministicScalar(int label) {
+    if (label < 0) {
+        return 0.0f;
+    }
+    uint32_t x = static_cast<uint32_t>(label + 1);
+    x *= 2654435761u;
+    x ^= (x >> 16u);
+    const float v = static_cast<float>(x & 0x00FFFFFFu) / static_cast<float>(0x00FFFFFFu);
+    return std::clamp(v, 0.0f, 1.0f);
+}
+
 struct ShaderProgram {
     GLuint program = 0;
 
@@ -247,19 +512,20 @@ struct ShaderProgram {
         if (this == &other) {
             return *this;
         }
-        if (program != 0) {
-            glDeleteProgram(program);
-        }
+        Destroy();
         program = other.program;
         other.program = 0;
         return *this;
     }
 
-    ~ShaderProgram() {
+    void Destroy() {
         if (program != 0) {
             glDeleteProgram(program);
+            program = 0;
         }
     }
+
+    ~ShaderProgram() { Destroy(); }
 
     static std::optional<ShaderProgram> Create(const char *vs_source, const char *fs_source, std::string &error) {
         auto compile = [&](GLenum type, const char *src) -> GLuint {
@@ -447,14 +713,18 @@ struct LineRenderer {
         glBindVertexArray(0);
     }
 
-    ~LineRenderer() {
+    void Destroy() {
         if (vbo) {
             glDeleteBuffers(1, &vbo);
+            vbo = 0;
         }
         if (vao) {
             glDeleteVertexArrays(1, &vao);
+            vao = 0;
         }
     }
+
+    ~LineRenderer() { Destroy(); }
 
     void DrawLines(const std::vector<glm::vec3> &pts) {
         if (pts.empty()) {
@@ -466,6 +736,19 @@ struct LineRenderer {
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(pts.size() * sizeof(glm::vec3)), pts.data(),
                      GL_DYNAMIC_DRAW);
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(pts.size()));
+        glBindVertexArray(0);
+    }
+
+    void DrawPoints(const std::vector<glm::vec3> &pts) {
+        if (pts.empty()) {
+            return;
+        }
+
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(pts.size() * sizeof(glm::vec3)), pts.data(),
+                     GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pts.size()));
         glBindVertexArray(0);
     }
 };
@@ -1079,6 +1362,17 @@ private:
 
     void Shutdown() {
         if (window_ != nullptr) {
+            SetCrashStage("Shutdown");
+            // Release GPU resources while a valid OpenGL context still exists.
+            glfwMakeContextCurrent(window_);
+            face_heatmap_renderer_.Destroy();
+            semantic_heatmap_renderer_.Destroy();
+            line_renderer_.Destroy();
+            mesh_gpu_.Destroy();
+            mesh_shader_.Destroy();
+            line_shader_.Destroy();
+            heatmap_shader_.Destroy();
+
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplGlfw_Shutdown();
             ImGui::DestroyContext();
@@ -1098,6 +1392,7 @@ private:
     std::string GetPathInput() const { return std::string(path_input_.data()); }
 
     bool LoadMesh(const fs::path &path, std::string &error) {
+        SetCrashStage("LoadMesh:begin");
         faithc::viewer::MeshData mesh;
         if (!faithc::viewer::LoadMeshFile(path, mesh, error)) {
             return false;
@@ -1122,13 +1417,34 @@ private:
             }
         }
 
-        UVSeamOverlay seam_overlay = BuildUVSeamOverlay(
-            mesh,
-            static_cast<double>(uv_seam_position_eps_),
-            static_cast<double>(uv_seam_uv_eps_)
-        );
+        UVSeamOverlay seam_overlay;
+        const bool is_generated_output = IsFaithCOutputPath(abs_path);
+        if (mesh.face_count() <= kSeamOverlayFaceLimit) {
+            SetCrashStage("LoadMesh:build_uv_seams");
+            if (is_generated_output) {
+                // For generated low mesh, use UV-boundary audit from final UVs instead of
+                // topology-route intermediates to avoid index drift visualization artifacts.
+                seam_overlay = BuildUVBoundaryAuditOverlay(
+                    mesh,
+                    static_cast<double>(uv_seam_position_eps_),
+                    static_cast<double>(uv_seam_uv_eps_)
+                );
+            } else {
+                seam_overlay = BuildUVSeamOverlay(
+                    mesh,
+                    static_cast<double>(uv_seam_position_eps_),
+                    static_cast<double>(uv_seam_uv_eps_)
+                );
+            }
+        } else {
+            seam_overlay = UVSeamOverlay{};
+            seam_overlay.has_uv = false;
+        }
         ClearAcceptedSampleHeatmap();
+        ClearSemanticHeatmap();
+        ClearClosureValidationSummary();
 
+        SetCrashStage("LoadMesh:upload_gpu");
         if (!mesh_gpu_.Upload(mesh, error)) {
             return false;
         }
@@ -1137,7 +1453,7 @@ private:
         display_uv_seams_ = seam_overlay;
         if (is_source_mesh) {
             source_uv_seams_ = seam_overlay;
-        } else if (IsFaithCOutputPath(abs_path)) {
+        } else if (is_generated_output) {
             low_generated_uv_seams_ = seam_overlay;
         }
         mesh_loaded_ = true;
@@ -1151,6 +1467,7 @@ private:
 
         camera_.FitToBounds(mesh_data_.min_bound, mesh_data_.max_bound);
         PushRecent(path);
+        SetCrashStage("LoadMesh:done");
         return true;
     }
 
@@ -1172,6 +1489,25 @@ private:
         accepted_sample_max_count_ = 0;
         accepted_sample_heatmap_source_.clear();
         accepted_sample_heatmap_status_.clear();
+    }
+
+    void ClearSemanticHeatmap() {
+        semantic_heatmap_renderer_.Destroy();
+        semantic_heatmap_available_ = false;
+        semantic_labels_raw_.clear();
+        semantic_face_count_ = 0;
+        semantic_unknown_face_count_ = 0;
+        semantic_unique_label_count_ = 0;
+        semantic_heatmap_source_.clear();
+        semantic_heatmap_status_.clear();
+    }
+
+    void ClearClosureValidationSummary() {
+        closure_summary_ = ClosureValidationSummary{};
+        closure_sidecar_source_.clear();
+        closure_validation_status_.clear();
+        low_algorithm_uv_seams_ = UVSeamOverlay{};
+        low_algorithm_uv_seams_.has_uv = false;
     }
 
     bool BuildAcceptedSampleHeatmapFromCounts(const std::vector<int> &accepted_counts, std::string &error) {
@@ -1276,6 +1612,192 @@ private:
         return true;
     }
 
+    bool BuildSemanticHeatmapFromLabels(const std::vector<int> &labels, std::string &error) {
+        if (!mesh_loaded_) {
+            error = "Semantic heatmap build failed: mesh not loaded";
+            return false;
+        }
+        const size_t face_count = mesh_data_.face_count();
+        if (labels.size() != face_count) {
+            std::ostringstream oss;
+            oss << "Semantic heatmap build failed: label length mismatch (" << labels.size() << " vs face_count "
+                << face_count << ")";
+            error = oss.str();
+            return false;
+        }
+        std::vector<float> scalar(face_count, 0.0f);
+        int unknown = 0;
+        std::unordered_set<int> uniq;
+        uniq.reserve(face_count / 4 + 8);
+        for (size_t i = 0; i < face_count; ++i) {
+            const int label = labels[i];
+            if (label < 0) {
+                scalar[i] = 0.0f;
+                unknown += 1;
+                continue;
+            }
+            scalar[i] = LabelToDeterministicScalar(label);
+            uniq.insert(label);
+        }
+        if (!semantic_heatmap_renderer_.Upload(mesh_data_, scalar, error)) {
+            return false;
+        }
+        semantic_labels_raw_ = labels;
+        semantic_heatmap_available_ = true;
+        semantic_face_count_ = static_cast<int>(face_count);
+        semantic_unknown_face_count_ = unknown;
+        semantic_unique_label_count_ = static_cast<int>(uniq.size());
+        return true;
+    }
+
+    bool LoadClosureValidationFromResult(const FaithCJobResult &result, std::string &error) {
+        ClearSemanticHeatmap();
+        ClearClosureValidationSummary();
+
+        fs::path sidecar = result.status_json.parent_path() / (result.status_json.stem().string() + ".uv_closure_validation.json");
+        std::error_code ec;
+        sidecar = fs::absolute(sidecar, ec);
+        if (ec || !fs::exists(sidecar)) {
+            error = "Closure-validation sidecar not found: " + sidecar.string();
+            return false;
+        }
+
+        json payload;
+        try {
+            std::ifstream in(sidecar);
+            in >> payload;
+        } catch (const std::exception &e) {
+            error = std::string("Failed to parse closure-validation sidecar: ") + e.what();
+            return false;
+        }
+
+        if (!payload.contains("semantic_labels") || !payload["semantic_labels"].is_array()) {
+            error = "Closure-validation sidecar missing 'semantic_labels' array";
+            return false;
+        }
+        std::vector<int> labels;
+        labels.reserve(payload["semantic_labels"].size());
+        for (const auto &v : payload["semantic_labels"]) {
+            if (v.is_number_integer()) {
+                labels.push_back(v.get<int>());
+            } else if (v.is_number_float()) {
+                labels.push_back(static_cast<int>(std::llround(v.get<double>())));
+            } else {
+                labels.push_back(-1);
+            }
+        }
+        if (!BuildSemanticHeatmapFromLabels(labels, error)) {
+            return false;
+        }
+
+        low_algorithm_uv_seams_.has_uv = mesh_data_.has_uv;
+        if (payload.contains("seam_edges") && payload["seam_edges"].is_array()) {
+            for (const auto &e : payload["seam_edges"]) {
+                if (!e.is_array() || e.size() != 2 || !e[0].is_number_integer() || !e[1].is_number_integer()) {
+                    continue;
+                }
+                const int a = e[0].get<int>();
+                const int b = e[1].get<int>();
+                if (a < 0 || b < 0 || static_cast<size_t>(a) >= mesh_data_.vertex_count() ||
+                    static_cast<size_t>(b) >= mesh_data_.vertex_count()) {
+                    continue;
+                }
+                low_algorithm_uv_seams_.line_points.push_back(ReadVertexPosition(mesh_data_, static_cast<size_t>(a)));
+                low_algorithm_uv_seams_.line_points.push_back(ReadVertexPosition(mesh_data_, static_cast<size_t>(b)));
+                low_algorithm_uv_seams_.seam_edges += 1;
+                low_algorithm_uv_seams_.interior_seam_edges += 1;
+            }
+        }
+
+        auto parse_bool = [](const json &obj, const char *key, bool fallback) -> bool {
+            if (!obj.contains(key) || obj[key].is_null()) {
+                return fallback;
+            }
+            const auto &v = obj[key];
+            if (v.is_boolean()) {
+                return v.get<bool>();
+            }
+            if (v.is_number()) {
+                return v.get<double>() != 0.0;
+            }
+            return fallback;
+        };
+        auto parse_int = [](const json &obj, const char *key, int fallback) -> int {
+            if (!obj.contains(key) || obj[key].is_null()) {
+                return fallback;
+            }
+            const auto &v = obj[key];
+            if (v.is_number_integer()) {
+                return v.get<int>();
+            }
+            if (v.is_number_float()) {
+                return static_cast<int>(std::llround(v.get<double>()));
+            }
+            return fallback;
+        };
+        auto parse_double = [](const json &obj, const char *key, double fallback) -> double {
+            if (!obj.contains(key) || obj[key].is_null()) {
+                return fallback;
+            }
+            const auto &v = obj[key];
+            if (v.is_number()) {
+                return v.get<double>();
+            }
+            return fallback;
+        };
+        auto parse_string = [](const json &obj, const char *key, const std::string &fallback) -> std::string {
+            if (!obj.contains(key) || obj[key].is_null()) {
+                return fallback;
+            }
+            const auto &v = obj[key];
+            if (v.is_string()) {
+                return v.get<std::string>();
+            }
+            return fallback;
+        };
+
+        const json *summary = nullptr;
+        if (payload.contains("summary") && payload["summary"].is_object()) {
+            summary = &payload["summary"];
+        } else if (payload.is_object()) {
+            summary = &payload;
+        }
+        if (summary != nullptr) {
+            closure_summary_.available = true;
+            closure_summary_.partition_has_leakage =
+                parse_bool(*summary, "partition_has_leakage", false);
+            closure_summary_.seam_topology_valid = parse_bool(*summary, "seam_topology_valid", false);
+            closure_summary_.partition_mixed_components =
+                parse_int(*summary, "partition_mixed_components", -1);
+            closure_summary_.partition_label_split_count =
+                parse_int(*summary, "partition_label_split_count", -1);
+            closure_summary_.seam_components = parse_int(*summary, "seam_components", -1);
+            closure_summary_.seam_loops_closed = parse_int(*summary, "seam_loops_closed", -1);
+            closure_summary_.seam_components_open = parse_int(*summary, "seam_components_open", -1);
+            closure_summary_.low_island_count = parse_int(*summary, "low_island_count", -1);
+            closure_summary_.high_island_count = parse_int(*summary, "high_island_count", -1);
+            closure_summary_.semantic_unknown_faces = parse_int(*summary, "semantic_unknown_faces", -1);
+            closure_summary_.uv_bbox_iou_mean = parse_double(*summary, "uv_bbox_iou_mean", -1.0);
+            closure_summary_.uv_overlap_ratio = parse_double(*summary, "uv_overlap_ratio", -1.0);
+            closure_summary_.uv_stretch_p95 = parse_double(*summary, "uv_stretch_p95", -1.0);
+            closure_summary_.uv_stretch_p99 = parse_double(*summary, "uv_stretch_p99", -1.0);
+            closure_summary_.uv_png_path = parse_string(*summary, "uv_validation_png", "");
+        }
+        if (closure_summary_.uv_png_path.empty()) {
+            closure_summary_.uv_png_path = parse_string(payload, "uv_validation_png", "");
+        }
+
+        semantic_heatmap_source_ = sidecar.string();
+        closure_sidecar_source_ = sidecar.string();
+        std::ostringstream oss;
+        oss << "Closure validation loaded: semantic_faces=" << semantic_face_count_
+            << ", unknown=" << semantic_unknown_face_count_ << ", seam_edges="
+            << low_algorithm_uv_seams_.seam_edges;
+        semantic_heatmap_status_ = oss.str();
+        closure_validation_status_ = oss.str();
+        return true;
+    }
+
     const UVSeamOverlay *GetActiveUVSeamOverlay(const char **label = nullptr) const {
         if (label) {
             *label = "none";
@@ -1293,6 +1815,12 @@ private:
             if (label) {
                 *label = "low/generated seams";
             }
+            if (low_algorithm_uv_seams_.has_uv && !low_algorithm_uv_seams_.line_points.empty()) {
+                if (label) {
+                    *label = "low/algorithm seams";
+                }
+                return &low_algorithm_uv_seams_;
+            }
             if (low_generated_uv_seams_.has_uv) {
                 return &low_generated_uv_seams_;
             }
@@ -1304,6 +1832,7 @@ private:
     }
 
     void DrawScene(const glm::mat4 &mvp, const glm::mat4 &model) {
+        SetCrashStage("DrawScene");
         if (mesh_loaded_) {
             if (enable_backface_culling_) {
                 glEnable(GL_CULL_FACE);
@@ -1342,6 +1871,19 @@ private:
             if (use_texture) {
                 glBindTexture(GL_TEXTURE_2D, 0);
             }
+        }
+
+        if (show_semantic_heatmap_ && semantic_heatmap_available_) {
+            glUseProgram(heatmap_shader_.program);
+            glUniformMatrix4fv(glGetUniformLocation(heatmap_shader_.program, "u_mvp"), 1, GL_FALSE, &mvp[0][0]);
+            glUniform1f(glGetUniformLocation(heatmap_shader_.program, "u_alpha"), semantic_heatmap_alpha_);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-0.8f, -0.8f);
+            semantic_heatmap_renderer_.Draw();
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glDisable(GL_BLEND);
         }
 
         if (show_accepted_sample_heatmap_ && accepted_sample_heatmap_available_) {
@@ -1396,22 +1938,46 @@ private:
             line_renderer_.DrawLines(lines);
         }
 
-        const UVSeamOverlay *active_seams = GetActiveUVSeamOverlay(nullptr);
-        if (active_seams != nullptr && !active_seams->line_points.empty()) {
+        auto draw_overlay_lines = [&](const std::vector<glm::vec3> &pts, const glm::vec3 &color, float width) {
+            if (pts.empty()) {
+                return;
+            }
             const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
             glDisable(GL_DEPTH_TEST);
-            glLineWidth(std::max(1.0f, uv_seam_line_width_));
-            glUniform3f(glGetUniformLocation(line_shader_.program, "u_color"), uv_seam_color_.x, uv_seam_color_.y,
-                        uv_seam_color_.z);
-            line_renderer_.DrawLines(active_seams->line_points);
+            glLineWidth(std::max(1.0f, width));
+            glUniform3f(glGetUniformLocation(line_shader_.program, "u_color"), color.x, color.y, color.z);
+            line_renderer_.DrawLines(pts);
             glLineWidth(1.0f);
             if (depth_enabled == GL_TRUE) {
                 glEnable(GL_DEPTH_TEST);
             }
+        };
+
+        const bool showing_generated_output = IsFaithCOutputPath(display_mesh_path_);
+        if (show_uv_island_seams_) {
+            if (show_compare_uv_seams_ && showing_generated_output && source_uv_seams_.has_uv) {
+                draw_overlay_lines(source_uv_seams_.line_points, compare_high_seam_color_, uv_seam_line_width_);
+                const UVSeamOverlay *low_overlay = nullptr;
+                if (low_algorithm_uv_seams_.has_uv && !low_algorithm_uv_seams_.line_points.empty()) {
+                    low_overlay = &low_algorithm_uv_seams_;
+                } else if (low_generated_uv_seams_.has_uv && !low_generated_uv_seams_.line_points.empty()) {
+                    low_overlay = &low_generated_uv_seams_;
+                }
+                if (low_overlay != nullptr) {
+                    draw_overlay_lines(low_overlay->line_points, compare_low_seam_color_, uv_seam_line_width_);
+                }
+            } else {
+                const UVSeamOverlay *active_seams = GetActiveUVSeamOverlay(nullptr);
+                if (active_seams != nullptr && !active_seams->line_points.empty()) {
+                    draw_overlay_lines(active_seams->line_points, uv_seam_color_, uv_seam_line_width_);
+                }
+            }
         }
+
     }
 
     void StartFaithCJob() {
+        SetCrashStage("StartFaithCJob");
         if (!mesh_loaded_ || current_source_mesh_.empty() || job_running_) {
             return;
         }
@@ -1463,6 +2029,7 @@ private:
     }
 
     void PollFaithCJob() {
+        SetCrashStage("PollFaithCJob:begin");
         if (!job_running_ || !job_future_.valid()) {
             return;
         }
@@ -1471,6 +2038,7 @@ private:
             return;
         }
 
+        SetCrashStage("PollFaithCJob:get_future");
         FaithCJobResult result = job_future_.get();
         job_running_ = false;
 
@@ -1490,6 +2058,7 @@ private:
         }
 
         std::string error;
+        SetCrashStage("PollFaithCJob:load_output_mesh");
         if (!LoadMesh(result.output_mesh, error)) {
             status_text_ = "FaithC output load failed: " + error;
             return;
@@ -1499,13 +2068,19 @@ private:
         if (!LoadAcceptedSampleHeatmapFromResult(result, heatmap_error)) {
             accepted_sample_heatmap_status_ = heatmap_error;
         }
-
+        std::string closure_error;
+        if (!LoadClosureValidationFromResult(result, closure_error)) {
+            closure_validation_status_ = closure_error;
+        }
         last_job_result_ = result;
         status_text_ = faithc::viewer::BuildFaithCJobSummary(result);
+        SetCrashStage("PollFaithCJob:done");
     }
 
     void DrawUI() {
+        SetCrashStage("DrawUI");
         DrawControlsUI();
+        DrawExperimentsUI();
         DrawOutputUI();
     }
 
@@ -1552,38 +2127,6 @@ private:
         ImGui::Checkbox("Backface Culling", &enable_backface_culling_);
         ImGui::Checkbox("Show Axes", &show_axes_);
         ImGui::Checkbox("Show Bounding Box", &show_bbox_);
-        ImGui::Checkbox("Show UV Island Seams", &show_uv_island_seams_);
-        ImGui::ColorEdit3("UV Seam Color", &uv_seam_color_.x);
-        ImGui::SliderFloat("UV Seam Width", &uv_seam_line_width_, 1.0f, 4.0f, "%.1f");
-        ImGui::Checkbox("Show Accepted-Samples Heatmap", &show_accepted_sample_heatmap_);
-        ImGui::SliderFloat("Accepted Heatmap Alpha", &accepted_sample_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
-        bool changed_log_scale = ImGui::Checkbox("Accepted Heatmap Log Scale", &accepted_sample_heatmap_log_scale_);
-        if (changed_log_scale && !accepted_sample_counts_raw_.empty()) {
-            std::string rebuild_error;
-            if (!BuildAcceptedSampleHeatmapFromCounts(accepted_sample_counts_raw_, rebuild_error)) {
-                accepted_sample_heatmap_status_ = rebuild_error;
-            }
-        }
-        const char *seam_label = nullptr;
-        const UVSeamOverlay *seam_overlay = GetActiveUVSeamOverlay(&seam_label);
-        if (seam_overlay != nullptr) {
-            ImGui::Text("UV Seam Source: %s", seam_label);
-            ImGui::Text("Seam edges: %d (boundary=%d, interior=%d, nonmanifold=%d)", seam_overlay->seam_edges,
-                        seam_overlay->boundary_edges, seam_overlay->interior_seam_edges, seam_overlay->nonmanifold_edges);
-        } else {
-            ImGui::TextDisabled("UV seam overlay unavailable for current mesh.");
-        }
-        if (accepted_sample_heatmap_available_) {
-            ImGui::Text("Accepted samples: faces=%d, nonzero=%d, max=%d", accepted_sample_face_count_,
-                        accepted_sample_nonzero_faces_, accepted_sample_max_count_);
-            if (!accepted_sample_heatmap_source_.empty()) {
-                ImGui::TextWrapped("Accepted sidecar: %s", accepted_sample_heatmap_source_.c_str());
-            }
-        } else if (!accepted_sample_heatmap_status_.empty()) {
-            ImGui::TextDisabled("Accepted heatmap: %s", accepted_sample_heatmap_status_.c_str());
-        } else {
-            ImGui::TextDisabled("Accepted heatmap: unavailable");
-        }
         if (mesh_data_.has_uv && mesh_data_.has_base_color_texture && mesh_gpu_.HasBaseColorTexture()) {
             ImGui::Checkbox("Use BaseColor Texture", &use_basecolor_texture_);
         } else {
@@ -1686,6 +2229,92 @@ private:
         ImGui::End();
     }
 
+    void DrawExperimentsUI() {
+        ImGui::SetNextWindowPos(ImVec2(1048, 8), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(540, 860), ImGuiCond_FirstUseEver);
+        ImGui::Begin("FaithC Experiments");
+
+        ImGui::SeparatorText("Overlay Toggles");
+        ImGui::Checkbox("Show UV Island Seams", &show_uv_island_seams_);
+        ImGui::Checkbox("Compare High vs Low Seams", &show_compare_uv_seams_);
+        ImGui::ColorEdit3("Compare High Seam Color", &compare_high_seam_color_.x);
+        ImGui::ColorEdit3("Compare Low Seam Color", &compare_low_seam_color_.x);
+        ImGui::ColorEdit3("UV Seam Color", &uv_seam_color_.x);
+        ImGui::SliderFloat("UV Seam Width", &uv_seam_line_width_, 1.0f, 4.0f, "%.1f");
+
+        ImGui::Checkbox("Semantic-ID Heatmap", &show_semantic_heatmap_);
+        ImGui::SliderFloat("Semantic Heatmap Alpha", &semantic_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
+
+        ImGui::Checkbox("Accepted-Samples Heatmap", &show_accepted_sample_heatmap_);
+        ImGui::SliderFloat("Accepted Heatmap Alpha", &accepted_sample_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
+        bool changed_log_scale = ImGui::Checkbox("Accepted Heatmap Log Scale", &accepted_sample_heatmap_log_scale_);
+        if (changed_log_scale && !accepted_sample_counts_raw_.empty()) {
+            std::string rebuild_error;
+            if (!BuildAcceptedSampleHeatmapFromCounts(accepted_sample_counts_raw_, rebuild_error)) {
+                accepted_sample_heatmap_status_ = rebuild_error;
+            }
+        }
+
+        ImGui::SeparatorText("Diagnostics");
+        const char *seam_label = nullptr;
+        const UVSeamOverlay *seam_overlay = GetActiveUVSeamOverlay(&seam_label);
+        if (seam_overlay != nullptr) {
+            ImGui::Text("UV Seam Source: %s", seam_label);
+            ImGui::Text("Seam edges: %d (boundary=%d, interior=%d, nonmanifold=%d)", seam_overlay->seam_edges,
+                        seam_overlay->boundary_edges, seam_overlay->interior_seam_edges, seam_overlay->nonmanifold_edges);
+        } else {
+            ImGui::TextDisabled("UV seam overlay unavailable for current mesh.");
+        }
+
+        if (semantic_heatmap_available_) {
+            ImGui::Text("Semantic labels: faces=%d, unknown=%d, unique=%d", semantic_face_count_,
+                        semantic_unknown_face_count_, semantic_unique_label_count_);
+            if (!semantic_heatmap_source_.empty()) {
+                ImGui::TextWrapped("Semantic sidecar: %s", semantic_heatmap_source_.c_str());
+            }
+        } else if (!semantic_heatmap_status_.empty()) {
+            ImGui::TextDisabled("Semantic: %s", semantic_heatmap_status_.c_str());
+        } else {
+            ImGui::TextDisabled("Semantic: unavailable");
+        }
+
+        if (accepted_sample_heatmap_available_) {
+            ImGui::Text("Accepted: faces=%d, nonzero=%d, max=%d", accepted_sample_face_count_,
+                        accepted_sample_nonzero_faces_, accepted_sample_max_count_);
+            if (!accepted_sample_heatmap_source_.empty()) {
+                ImGui::TextWrapped("Accepted sidecar: %s", accepted_sample_heatmap_source_.c_str());
+            }
+        } else if (!accepted_sample_heatmap_status_.empty()) {
+            ImGui::TextDisabled("Accepted: %s", accepted_sample_heatmap_status_.c_str());
+        } else {
+            ImGui::TextDisabled("Accepted: unavailable");
+        }
+
+        if (closure_summary_.available) {
+            ImGui::SeparatorText("Closure Loop");
+            ImGui::Text("Seam topology valid: %s", closure_summary_.seam_topology_valid ? "yes" : "no");
+            ImGui::Text("Seam components/open/closed: %d / %d / %d", closure_summary_.seam_components,
+                        closure_summary_.seam_components_open, closure_summary_.seam_loops_closed);
+            ImGui::Text("Partition leakage: %s (mixed=%d, split=%d)",
+                        closure_summary_.partition_has_leakage ? "yes" : "no",
+                        closure_summary_.partition_mixed_components, closure_summary_.partition_label_split_count);
+            ImGui::Text("Islands high/low: %d / %d", closure_summary_.high_island_count, closure_summary_.low_island_count);
+            ImGui::Text("UV bbox IoU mean: %.4f", closure_summary_.uv_bbox_iou_mean);
+            ImGui::Text("UV overlap ratio: %.6f", closure_summary_.uv_overlap_ratio);
+            ImGui::Text("UV stretch p95/p99: %.4f / %.4f", closure_summary_.uv_stretch_p95, closure_summary_.uv_stretch_p99);
+            if (!closure_summary_.uv_png_path.empty()) {
+                ImGui::TextWrapped("UV validation PNG: %s", closure_summary_.uv_png_path.c_str());
+            }
+            if (!closure_sidecar_source_.empty()) {
+                ImGui::TextWrapped("Closure sidecar: %s", closure_sidecar_source_.c_str());
+            }
+        } else if (!closure_validation_status_.empty()) {
+            ImGui::TextDisabled("Closure: %s", closure_validation_status_.c_str());
+        }
+
+        ImGui::End();
+    }
+
 private:
     LaunchOptions options_;
     GLFWwindow *window_ = nullptr;
@@ -1696,6 +2325,7 @@ private:
     MeshGPU mesh_gpu_;
     LineRenderer line_renderer_;
     FaceHeatmapRenderer face_heatmap_renderer_;
+    FaceHeatmapRenderer semantic_heatmap_renderer_;
 
     faithc::viewer::MeshData mesh_data_;
     bool mesh_loaded_ = false;
@@ -1707,26 +2337,42 @@ private:
     bool show_axes_ = true;
     bool show_bbox_ = true;
     bool show_uv_island_seams_ = false;
+    bool show_compare_uv_seams_ = true;
+    bool show_semantic_heatmap_ = true;
     bool show_accepted_sample_heatmap_ = false;
     bool use_basecolor_texture_ = true;
 
     glm::vec3 mesh_color_ = glm::vec3(0.80f, 0.79f, 0.74f);
     glm::vec3 background_color_ = glm::vec3(0.09f, 0.10f, 0.12f);
     glm::vec3 uv_seam_color_ = glm::vec3(1.0f, 0.2f, 0.1f);
+    glm::vec3 compare_high_seam_color_ = glm::vec3(0.15f, 0.95f, 1.0f);
+    glm::vec3 compare_low_seam_color_ = glm::vec3(1.0f, 0.2f, 0.1f);
     float uv_seam_line_width_ = 1.0f;
     float uv_seam_position_eps_ = 1e-6f;
     float uv_seam_uv_eps_ = 1e-5f;
+    float semantic_heatmap_alpha_ = 0.58f;
     float accepted_sample_heatmap_alpha_ = 0.72f;
     bool accepted_sample_heatmap_log_scale_ = true;
 
     UVSeamOverlay source_uv_seams_;
     UVSeamOverlay low_generated_uv_seams_;
+    UVSeamOverlay low_algorithm_uv_seams_;
     UVSeamOverlay display_uv_seams_;
+    ClosureValidationSummary closure_summary_;
     std::vector<int> accepted_sample_counts_raw_;
+    std::vector<int> semantic_labels_raw_;
+    bool semantic_heatmap_available_ = false;
     bool accepted_sample_heatmap_available_ = false;
+    int semantic_face_count_ = 0;
+    int semantic_unknown_face_count_ = 0;
+    int semantic_unique_label_count_ = 0;
     int accepted_sample_face_count_ = 0;
     int accepted_sample_nonzero_faces_ = 0;
     int accepted_sample_max_count_ = 0;
+    std::string semantic_heatmap_source_;
+    std::string closure_sidecar_source_;
+    std::string semantic_heatmap_status_;
+    std::string closure_validation_status_;
     std::string accepted_sample_heatmap_source_;
     std::string accepted_sample_heatmap_status_;
 
@@ -1870,6 +2516,8 @@ private:
 }  // namespace
 
 int main(int argc, char **argv) {
+    InstallCrashHandlers();
+    SetCrashStage("main:startup");
     LaunchOptions options;
     std::string error;
     if (!ParseArgs(argc, argv, options, error)) {

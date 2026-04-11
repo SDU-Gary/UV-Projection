@@ -7,9 +7,10 @@ import trimesh
 
 from ..halfedge_topology import (
     compute_high_face_uv_islands,
-    detect_cut_edges_from_face_labels,
     split_vertices_along_cut_edges,
 )
+from .mesh_sanitizer import ensure_halfedge_external_dependencies, sanitize_mesh_for_halfedge
+from .openmesh_seams import extract_seam_edges_openmesh, validate_face_partition_by_seams
 from .correspondence import (
     build_high_cuda_context,
     correspond_points_hybrid,
@@ -19,6 +20,7 @@ from .correspondence import (
 from .linear_solver import interpolate_sample_uv, solve_global_uv
 from .quality import texture_gradient_weights, texture_reprojection_error
 from .sampling import sample_low_mesh
+from .semantic_transfer import transfer_face_semantics_by_projection
 from .texture_io import get_vertex_normals, resolve_device
 
 
@@ -115,6 +117,9 @@ def _compute_pass_correspondence(
     island_guard_fallback_policy: str,
     expected_face_island: Optional[np.ndarray],
     expected_face_confidence: Optional[np.ndarray],
+    fixed_face_island: Optional[np.ndarray],
+    fixed_face_conflict: Optional[np.ndarray],
+    fixed_face_confidence: Optional[np.ndarray],
     min_valid_samples_per_face: int,
     guard_error: Optional[str],
 ) -> Dict[str, Any]:
@@ -204,7 +209,18 @@ def _compute_pass_correspondence(
     low_face_island = np.full((n_faces,), -1, dtype=np.int64)
     low_face_conflict = np.zeros((n_faces,), dtype=np.bool_)
     low_face_confidence = np.zeros((n_faces,), dtype=np.float32)
-    if high_face_island is not None:
+    if (
+        fixed_face_island is not None
+        and fixed_face_conflict is not None
+        and fixed_face_confidence is not None
+        and fixed_face_island.shape[0] == n_faces
+        and fixed_face_conflict.shape[0] == n_faces
+        and fixed_face_confidence.shape[0] == n_faces
+    ):
+        low_face_island = np.asarray(fixed_face_island, dtype=np.int64, copy=False)
+        low_face_conflict = np.asarray(fixed_face_conflict, dtype=np.bool_, copy=False)
+        low_face_confidence = np.asarray(fixed_face_confidence, dtype=np.float32, copy=False)
+    elif high_face_island is not None:
         low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
             sample_face_ids=sample_face_ids,
             target_face_ids=target_face_ids,
@@ -232,6 +248,7 @@ def _prepare_solver_inputs(
     low_mesh: trimesh.Trimesh,
     sample_face_ids: np.ndarray,
     target_uv: np.ndarray,
+    target_face_ids: np.ndarray,
     valid_mask: np.ndarray,
     seam_cfg: Dict[str, Any],
     seam_strategy_used: str,
@@ -239,10 +256,14 @@ def _prepare_solver_inputs(
     low_face_island: np.ndarray,
     low_face_conflict: np.ndarray,
     unknown_face_policy: str,
+    seam_validation_strict: bool,
+    seam_validation_require_closed: bool,
+    seam_validation_require_pure_components: bool,
 ) -> Dict[str, Any]:
     n_faces = int(len(low_mesh.faces))
     cross_seam_face_mask = np.zeros(n_faces, dtype=np.bool_)
     seam_face_ids = np.zeros((0,), dtype=np.int64)
+    seam_edges_out = np.zeros((0, 2), dtype=np.int64)
     solve_mesh = low_mesh
     smooth_face_mask: Optional[np.ndarray] = None
     solver_valid_mask = valid_mask.copy()
@@ -253,20 +274,71 @@ def _prepare_solver_inputs(
         seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
 
     if seam_strategy_used == "halfedge_island" and high_face_island is not None:
-        cut_edges = detect_cut_edges_from_face_labels(
-            np.asarray(low_mesh.faces, dtype=np.int64),
-            low_face_island,
+        seam_result = extract_seam_edges_openmesh(
+            low_mesh=low_mesh,
+            face_labels=low_face_island,
+            include_boundary_as_seam=bool(seam_cfg.get("include_boundary_as_seam", False)),
         )
+        seam_edges = np.asarray(seam_result.seam_edges, dtype=np.int64, copy=False)
+        seam_edges_out = seam_edges.astype(np.int64, copy=False)
+        seam_meta.update(dict(seam_result.meta))
+        partition_meta = validate_face_partition_by_seams(
+            low_mesh=low_mesh,
+            face_labels=low_face_island,
+            seam_edges=seam_edges,
+        )
+        seam_meta.update(partition_meta)
+        seam_topology_ok = bool(seam_result.meta.get("uv_seam_topology_valid", False)) or (
+            not seam_validation_require_closed
+        )
+        seam_partition_ok = bool(partition_meta.get("uv_seam_partition_is_valid", False)) or (
+            not seam_validation_require_pure_components
+        )
+        seam_validation_ok = bool(seam_topology_ok and seam_partition_ok)
+        seam_meta["uv_seam_validation_ok"] = bool(seam_validation_ok)
+        if not seam_validation_ok:
+            seam_meta["uv_seam_validation_error"] = (
+                f"topology_ok={seam_topology_ok}, partition_ok={seam_partition_ok}, "
+                f"components_open={int(seam_result.meta.get('uv_seam_components_open', 0))}, "
+                f"mixed_components={int(partition_meta.get('uv_seam_partition_mixed_components', 0))}"
+            )
+            if seam_validation_strict:
+                raise RuntimeError(f"halfedge seam validation failed: {seam_meta['uv_seam_validation_error']}")
+        seam_meta["uv_halfedge_backend"] = "openmesh"
+
         split_vertices, split_faces, split_meta = split_vertices_along_cut_edges(
             vertices=np.asarray(low_mesh.vertices, dtype=np.float32),
             faces=np.asarray(low_mesh.faces, dtype=np.int64),
-            cut_edges=cut_edges,
+            cut_edges=seam_edges,
         )
-        if split_vertices.shape[0] != len(low_mesh.vertices):
+        if (
+            int(split_vertices.shape[0]) != int(len(low_mesh.vertices))
+            or int(split_faces.shape[0]) != int(len(low_mesh.faces))
+        ):
             solve_mesh = trimesh.Trimesh(vertices=split_vertices, faces=split_faces, process=False)
         seam_meta["uv_low_cut_edges"] = int(split_meta.get("cut_edges", 0))
         seam_meta["uv_low_split_vertices"] = int(split_meta.get("split_vertices_added", 0))
         seam_meta["uv_low_split_faces"] = int(split_meta.get("split_faces", len(split_faces)))
+        seam_meta["uv_halfedge_split_topology_applied"] = bool(solve_mesh is not low_mesh)
+        seam_meta.setdefault("uv_seam_uv_span_threshold", float(seam_cfg.get("uv_span_threshold", 0.35)))
+
+        sample_expected_island = low_face_island[sample_face_ids]
+        sample_expected_conflict = low_face_conflict[sample_face_ids]
+        sample_hit_island = np.full((len(target_face_ids),), -1, dtype=np.int64)
+        ok_hit = (target_face_ids >= 0) & (target_face_ids < len(high_face_island))
+        if np.any(ok_hit):
+            sample_hit_island[ok_hit] = high_face_island[target_face_ids[ok_hit]]
+        strict_keep = (
+            (sample_expected_island >= 0)
+            & (~sample_expected_conflict)
+            & (sample_hit_island == sample_expected_island)
+        )
+        before_mask = solver_valid_mask.copy()
+        solver_valid_mask &= strict_keep
+        rejected = int(np.count_nonzero(before_mask & (~solver_valid_mask)))
+        seam_meta["uv_island_strict_filter_enabled"] = True
+        seam_meta["uv_island_strict_reject_count"] = int(rejected)
+        seam_meta["uv_island_strict_reject_ratio"] = float(rejected / max(1, int(np.count_nonzero(before_mask))))
     else:
         cross_seam_face_mask = detect_cross_seam_faces(
             sample_face_ids=sample_face_ids,
@@ -285,6 +357,10 @@ def _prepare_solver_inputs(
             float(cross_seam_face_mask.mean()) if cross_seam_face_mask.size > 0 else 0.0
         )
         seam_meta["uv_seam_uv_span_threshold"] = float(seam_cfg.get("uv_span_threshold", 0.35))
+        seam_meta["uv_halfedge_split_topology_applied"] = False
+        seam_meta["uv_island_strict_filter_enabled"] = False
+        seam_meta["uv_island_strict_reject_count"] = 0
+        seam_meta["uv_island_strict_reject_ratio"] = 0.0
 
     if unknown_face_policy == "exclude" and high_face_island is not None:
         sample_face_island = low_face_island[sample_face_ids]
@@ -296,6 +372,7 @@ def _prepare_solver_inputs(
         "smooth_face_mask": smooth_face_mask,
         "cross_seam_face_mask": cross_seam_face_mask,
         "seam_face_ids": seam_face_ids,
+        "seam_edges": seam_edges_out,
         "seam_meta": seam_meta,
     }
 
@@ -412,13 +489,6 @@ def _run_hybrid_iterative(
         Tuple[np.ndarray, Dict[str, Any]],
     ],
 ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
-    sample = sample_low_mesh(low_mesh, cfg["sample"])
-    sample_points = sample["points"]
-    sample_face_ids = sample["face_ids"]
-    sample_bary = sample["bary"]
-    sample_normals = sample["normals"]
-    sample_area_weights = sample["area_weights"]
-
     resolved = resolve_device(device)
     if resolved != "cuda":
         mapped_uv, stats = barycentric_mapper(high_mesh, low_mesh, high_uv, resolved, cfg)
@@ -448,6 +518,9 @@ def _run_hybrid_iterative(
     island_guard_fallback_policy = str(
         seam_cfg.get("uv_island_guard_fallback", "nearest_same_island_then_udf")
     )
+    seam_validation_strict = bool(seam_cfg.get("validation_strict", True))
+    seam_validation_require_closed = bool(seam_cfg.get("validation_require_closed_loops", True))
+    seam_validation_require_pure = bool(seam_cfg.get("validation_require_pure_components", True))
 
     max_iters = max(1, int(iterative_cfg.get("max_iters", 4)))
     min_iters = max(1, int(iterative_cfg.get("min_iters", 2)))
@@ -461,7 +534,31 @@ def _run_hybrid_iterative(
     if unknown_face_policy not in {"exclude", "allow"}:
         unknown_face_policy = "exclude"
 
-    n_faces = int(len(low_mesh.faces))
+    work_low_mesh = low_mesh
+    seam_meta_seed: Dict[str, Any] = {}
+    if seam_strategy_requested == "halfedge_island":
+        ensure_halfedge_external_dependencies()
+        work_low_mesh, sanitize_meta = sanitize_mesh_for_halfedge(low_mesh=low_mesh, seam_cfg=seam_cfg)
+        seam_meta_seed.update(sanitize_meta)
+        seam_meta_seed["uv_halfedge_split_requested"] = True
+        seam_meta_seed["uv_halfedge_split_topology_applied"] = False
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = False
+    else:
+        seam_meta_seed["uv_halfedge_split_requested"] = False
+        seam_meta_seed["uv_halfedge_split_topology_applied"] = False
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = False
+    seam_meta_seed["uv_seam_validation_strict"] = bool(seam_validation_strict)
+    seam_meta_seed["uv_seam_validation_require_closed_loops"] = bool(seam_validation_require_closed)
+    seam_meta_seed["uv_seam_validation_require_pure_components"] = bool(seam_validation_require_pure)
+
+    sample = sample_low_mesh(work_low_mesh, cfg["sample"])
+    sample_points = sample["points"]
+    sample_face_ids = sample["face_ids"]
+    sample_bary = sample["bary"]
+    sample_normals = sample["normals"]
+    sample_area_weights = sample["area_weights"]
+
+    n_faces = int(len(work_low_mesh.faces))
 
     high_ctx = build_high_cuda_context(
         high_mesh=high_mesh,
@@ -469,13 +566,36 @@ def _run_hybrid_iterative(
         device=resolved,
     )
 
-    high_face_island, _, seam_strategy_used, seam_meta_seed, guard_error = _prepare_high_islands(
+    high_face_island, _, seam_strategy_used, seam_meta_high, guard_error = _prepare_high_islands(
         high_mesh=high_mesh,
         high_uv=high_uv,
         seam_cfg=seam_cfg,
         seam_strategy_requested=seam_strategy_requested,
         island_guard_requested=island_guard_requested,
     )
+    seam_meta_seed.update(seam_meta_high)
+    if seam_strategy_requested == "halfedge_island" and seam_strategy_used != "halfedge_island":
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = True
+        if seam_validation_strict:
+            err = str(seam_meta_high.get("uv_halfedge_island_error", "unable to prepare high-face islands"))
+            raise RuntimeError(f"halfedge_island failed: {err}")
+
+    fixed_face_island: Optional[np.ndarray] = None
+    fixed_face_conflict: Optional[np.ndarray] = None
+    fixed_face_confidence: Optional[np.ndarray] = None
+    if seam_strategy_used == "halfedge_island" and high_face_island is not None:
+        semantic = transfer_face_semantics_by_projection(
+            high_ctx=high_ctx,
+            high_face_island=high_face_island,
+            low_mesh=work_low_mesh,
+            seam_cfg=seam_cfg,
+            corr_cfg=corr_cfg,
+        )
+        fixed_face_island = np.asarray(semantic["low_face_island"], dtype=np.int64, copy=False)
+        fixed_face_conflict = np.asarray(semantic["low_face_conflict"], dtype=np.bool_, copy=False)
+        fixed_face_confidence = np.asarray(semantic["low_face_confidence"], dtype=np.float32, copy=False)
+        seam_meta_seed.update(dict(semantic.get("meta", {})))
+        seam_meta_seed["uv_halfedge_backend"] = "openmesh"
 
     iter_energy_data: list[float] = []
     iter_label_change_ratio: list[float] = []
@@ -514,16 +634,20 @@ def _run_hybrid_iterative(
             island_guard_allow_unknown=island_guard_allow_unknown,
             island_guard_conf_min=island_guard_conf_min,
             island_guard_fallback_policy=island_guard_fallback_policy,
-            expected_face_island=prev_face_island,
-            expected_face_confidence=prev_face_confidence,
+            expected_face_island=fixed_face_island if fixed_face_island is not None else prev_face_island,
+            expected_face_confidence=fixed_face_confidence if fixed_face_confidence is not None else prev_face_confidence,
+            fixed_face_island=fixed_face_island,
+            fixed_face_conflict=fixed_face_conflict,
+            fixed_face_confidence=fixed_face_confidence,
             min_valid_samples_per_face=int(seam_cfg.get("min_valid_samples_per_face", 2)),
             guard_error=guard_error,
         )
 
         pass_inputs = _prepare_solver_inputs(
-            low_mesh=low_mesh,
+            low_mesh=work_low_mesh,
             sample_face_ids=sample_face_ids,
             target_uv=corr_pass["target_uv"],
+            target_face_ids=corr_pass["target_face_ids"],
             valid_mask=corr_pass["valid_mask"],
             seam_cfg=seam_cfg,
             seam_strategy_used=seam_strategy_used,
@@ -531,6 +655,9 @@ def _run_hybrid_iterative(
             low_face_island=corr_pass["low_face_island"],
             low_face_conflict=corr_pass["low_face_conflict"],
             unknown_face_policy=unknown_face_policy,
+            seam_validation_strict=seam_validation_strict,
+            seam_validation_require_closed=seam_validation_require_closed,
+            seam_validation_require_pure_components=seam_validation_require_pure,
         )
 
         solve_pass = _solve_pass(
@@ -609,7 +736,8 @@ def _run_hybrid_iterative(
             break
 
     if best_state is None:
-        mapped_uv, stats = barycentric_mapper(high_mesh, low_mesh, high_uv, resolved, cfg)
+        fallback_mesh = work_low_mesh if seam_strategy_requested == "halfedge_island" else low_mesh
+        mapped_uv, stats = barycentric_mapper(high_mesh, fallback_mesh, high_uv, resolved, cfg)
         stats["uv_mode_used"] = "barycentric_fallback_no_valid_samples"
         stats["uv_project_error"] = "Iterative hybrid correspondence had no valid samples after seam filtering"
         stats["uv_seam_strategy_used"] = seam_strategy_used
@@ -624,7 +752,7 @@ def _run_hybrid_iterative(
         stats["uv_iter_guard_mode_used"] = iter_guard_mode_used
         stats["uv_iter_early_stop_reason"] = early_stop_reason
         stats["uv_iter_best_index"] = None
-        return mapped_uv, stats, {"local_vertex_split_applied": False, "quality_mesh": low_mesh}
+        return mapped_uv, stats, {"local_vertex_split_applied": False, "quality_mesh": fallback_mesh}
 
     final_corr = best_state["corr"]
     final_inputs = best_state["inputs"]
@@ -636,9 +764,9 @@ def _run_hybrid_iterative(
     local_split_applied = False
 
     if seam_strategy_used != "halfedge_island" and bool(seam_cfg.get("local_vertex_split", True)) and seam_face_ids.size > 0:
-        low_faces = np.asarray(low_mesh.faces, dtype=np.int64)
-        low_verts = np.asarray(low_mesh.vertices, dtype=np.float32)
-        low_vn = get_vertex_normals(low_mesh)
+        low_faces = np.asarray(work_low_mesh.faces, dtype=np.int64)
+        low_verts = np.asarray(work_low_mesh.vertices, dtype=np.float32)
+        low_vn = get_vertex_normals(work_low_mesh)
 
         seam_corner_vid = low_faces[seam_face_ids]
         corner_points = low_verts[seam_corner_vid].reshape(-1, 3)
@@ -666,6 +794,7 @@ def _run_hybrid_iterative(
         "uv_color_reproj_l2": final_solve["color_l2"],
         "uv_local_vertex_split_faces": int(len(seam_face_ids)) if local_split_applied else 0,
         "uv_seam_strategy_requested": seam_strategy_requested,
+        "uv_seam_strategy_effective": seam_strategy_used,
         "uv_seam_strategy_used": seam_strategy_used,
         "uv_iterative_enabled": True,
         "uv_iter_count": int(len(iter_energy_data)),
@@ -682,6 +811,11 @@ def _run_hybrid_iterative(
         **final_corr["guard_meta"],
         **final_solve["solve_meta"],
     }
+    if bool(seam_cfg.get("emit_validation_sidecar_data", False)) and seam_strategy_used == "halfedge_island":
+        method_stats["uv_low_face_semantic_labels"] = np.asarray(
+            final_corr["low_face_island"], dtype=np.int64
+        ).tolist()
+        method_stats["uv_low_seam_edges"] = np.asarray(final_inputs["seam_edges"], dtype=np.int64).tolist()
 
     if seam_strategy_used == "halfedge_island":
         export_payload = {
@@ -716,13 +850,6 @@ def _run_hybrid_legacy_once(
         Tuple[np.ndarray, Dict[str, Any]],
     ],
 ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
-    sample = sample_low_mesh(low_mesh, cfg["sample"])
-    sample_points = sample["points"]
-    sample_face_ids = sample["face_ids"]
-    sample_bary = sample["bary"]
-    sample_normals = sample["normals"]
-    sample_area_weights = sample["area_weights"]
-
     resolved = resolve_device(device)
     if resolved != "cuda":
         mapped_uv, stats = nearest_mapper(high_mesh, low_mesh, high_uv)
@@ -735,6 +862,8 @@ def _run_hybrid_legacy_once(
 
     corr_cfg = cfg["correspondence"]
     seam_cfg = cfg.get("seam", {})
+    solve_cfg = cfg["solve"]
+    tex_weight_cfg = cfg["texture_weight"]
     seam_strategy_requested = str(seam_cfg.get("strategy", "legacy")).strip().lower()
     if seam_strategy_requested not in {"legacy", "halfedge_island"}:
         seam_strategy_requested = "legacy"
@@ -747,256 +876,195 @@ def _run_hybrid_legacy_once(
     island_guard_fallback_policy = str(
         seam_cfg.get("uv_island_guard_fallback", "nearest_same_island_then_udf")
     )
+    seam_validation_strict = bool(seam_cfg.get("validation_strict", True))
+    seam_validation_require_closed = bool(seam_cfg.get("validation_require_closed_loops", True))
+    seam_validation_require_pure = bool(seam_cfg.get("validation_require_pure_components", True))
+
+    work_low_mesh = low_mesh
+    seam_meta_seed: Dict[str, Any] = {}
+    if seam_strategy_requested == "halfedge_island":
+        ensure_halfedge_external_dependencies()
+        work_low_mesh, sanitize_meta = sanitize_mesh_for_halfedge(low_mesh=low_mesh, seam_cfg=seam_cfg)
+        seam_meta_seed.update(sanitize_meta)
+        seam_meta_seed["uv_halfedge_split_requested"] = True
+        seam_meta_seed["uv_halfedge_split_topology_applied"] = False
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = False
+    else:
+        seam_meta_seed["uv_halfedge_split_requested"] = False
+        seam_meta_seed["uv_halfedge_split_topology_applied"] = False
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = False
+    seam_meta_seed["uv_seam_validation_strict"] = bool(seam_validation_strict)
+    seam_meta_seed["uv_seam_validation_require_closed_loops"] = bool(seam_validation_require_closed)
+    seam_meta_seed["uv_seam_validation_require_pure_components"] = bool(seam_validation_require_pure)
+
+    sample = sample_low_mesh(work_low_mesh, cfg["sample"])
+    sample_points = sample["points"]
+    sample_face_ids = sample["face_ids"]
+    sample_bary = sample["bary"]
+    sample_normals = sample["normals"]
+    sample_area_weights = sample["area_weights"]
+    n_faces = int(len(work_low_mesh.faces))
 
     high_ctx = build_high_cuda_context(
         high_mesh=high_mesh,
         high_uv=high_uv,
         device=resolved,
     )
-    correspondence = correspond_points_hybrid(
-        points=sample_points,
-        point_normals=sample_normals,
+    high_face_island, _, seam_strategy_used, seam_meta_high, guard_error = _prepare_high_islands(
+        high_mesh=high_mesh,
+        high_uv=high_uv,
+        seam_cfg=seam_cfg,
+        seam_strategy_requested=seam_strategy_requested,
+        island_guard_requested=island_guard_requested,
+    )
+    seam_meta_seed.update(seam_meta_high)
+    if seam_strategy_requested == "halfedge_island" and seam_strategy_used != "halfedge_island":
+        seam_meta_seed["uv_halfedge_split_fallback_to_legacy"] = True
+        if seam_validation_strict:
+            err = str(seam_meta_high.get("uv_halfedge_island_error", "unable to prepare high-face islands"))
+            raise RuntimeError(f"halfedge_island failed: {err}")
+
+    fixed_face_island: Optional[np.ndarray] = None
+    fixed_face_conflict: Optional[np.ndarray] = None
+    fixed_face_confidence: Optional[np.ndarray] = None
+    if seam_strategy_used == "halfedge_island" and high_face_island is not None:
+        semantic = transfer_face_semantics_by_projection(
+            high_ctx=high_ctx,
+            high_face_island=high_face_island,
+            low_mesh=work_low_mesh,
+            seam_cfg=seam_cfg,
+            corr_cfg=corr_cfg,
+        )
+        fixed_face_island = np.asarray(semantic["low_face_island"], dtype=np.int64, copy=False)
+        fixed_face_conflict = np.asarray(semantic["low_face_conflict"], dtype=np.bool_, copy=False)
+        fixed_face_confidence = np.asarray(semantic["low_face_confidence"], dtype=np.float32, copy=False)
+        seam_meta_seed.update(dict(semantic.get("meta", {})))
+        seam_meta_seed["uv_halfedge_backend"] = "openmesh"
+
+    corr_pass = _compute_pass_correspondence(
+        sample_points=sample_points,
+        sample_normals=sample_normals,
+        sample_face_ids=sample_face_ids,
+        n_faces=n_faces,
         corr_cfg=corr_cfg,
         high_ctx=high_ctx,
+        high_face_island=high_face_island,
+        island_guard_requested=island_guard_requested,
+        island_guard_mode_requested=island_guard_mode_requested,
+        island_guard_mode_used=island_guard_mode_requested,
+        island_guard_allow_unknown=island_guard_allow_unknown,
+        island_guard_conf_min=island_guard_conf_min,
+        island_guard_fallback_policy=island_guard_fallback_policy,
+        expected_face_island=fixed_face_island,
+        expected_face_confidence=fixed_face_confidence,
+        fixed_face_island=fixed_face_island,
+        fixed_face_conflict=fixed_face_conflict,
+        fixed_face_confidence=fixed_face_confidence,
+        min_valid_samples_per_face=int(seam_cfg.get("min_valid_samples_per_face", 2)),
+        guard_error=guard_error,
     )
-    target_uv = correspondence["target_uv"]
-    target_face_ids = correspondence["target_face_ids"]
-    valid_mask = correspondence["valid_mask"]
-    primary_mask = correspondence["primary_mask"]
-    fallback_used_mask = correspondence["fallback_used_mask"]
 
-    n_faces = int(len(low_mesh.faces))
-    cross_seam_face_mask = np.zeros(n_faces, dtype=np.bool_)
-    seam_face_ids = np.zeros((0,), dtype=np.int64)
-    seam_corner_uv = np.zeros((0, 3, 2), dtype=np.float32)
-    local_split_applied = False
-
-    solve_mesh = low_mesh
-    smooth_face_mask: Optional[np.ndarray] = None
-    solver_valid_mask = valid_mask.copy()
-    seam_strategy_used = seam_strategy_requested
-    seam_meta: Dict[str, Any] = {}
-    guard_meta: Dict[str, Any] = {
-        "uv_island_guard_requested": island_guard_requested,
-        "uv_island_guard_mode_requested": island_guard_mode_requested,
-        "uv_island_guard_allow_unknown": island_guard_allow_unknown,
-        "uv_island_guard_confidence_min": island_guard_conf_min,
-        "uv_island_guard_fallback_policy": island_guard_fallback_policy,
-        "uv_island_guard_enabled": False,
-        "uv_island_guard_mode_used": "off",
-        "uv_island_guard_constrained_points": 0,
-        "uv_island_guard_constrained_ratio": 0.0,
-        "uv_island_guard_reject_count": 0,
-        "uv_island_guard_reject_ratio": 0.0,
-        "uv_island_guard_fallback_success_ratio": 0.0,
-        "uv_island_guard_invalid_after_guard_ratio": 0.0,
-    }
-
-    high_face_island: Optional[np.ndarray] = None
-    high_meta: Dict[str, Any] = {}
-    low_face_island = np.full((n_faces,), -1, dtype=np.int64)
-    low_face_conflict = np.zeros((n_faces,), dtype=np.bool_)
-    low_face_confidence = np.zeros((n_faces,), dtype=np.float32)
-
-    need_high_island = seam_strategy_requested == "halfedge_island" or island_guard_requested
-    if need_high_island:
-        try:
-            high_face_island, high_meta = compute_high_face_uv_islands(
-                vertices=np.asarray(high_mesh.vertices, dtype=np.float64),
-                faces=np.asarray(high_mesh.faces, dtype=np.int64),
-                uv=np.asarray(high_uv, dtype=np.float64),
-                position_eps=float(seam_cfg.get("high_position_eps", 1e-6)),
-                uv_eps=float(seam_cfg.get("high_uv_eps", 1e-5)),
-            )
-        except Exception as exc:
-            high_face_island = None
-            if seam_strategy_requested == "halfedge_island":
-                seam_strategy_used = "fallback_legacy"
-                seam_meta["uv_halfedge_island_error"] = str(exc)
-            if island_guard_requested:
-                guard_meta["uv_island_guard_error"] = str(exc)
-
-    if high_face_island is not None:
-        low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
+    # Legacy non-iterative mode keeps one extra guarded pass for non-fixed labels.
+    if (
+        fixed_face_island is None
+        and island_guard_requested
+        and high_face_island is not None
+        and np.any(corr_pass["low_face_island"] >= 0)
+    ):
+        corr_pass = _compute_pass_correspondence(
+            sample_points=sample_points,
+            sample_normals=sample_normals,
             sample_face_ids=sample_face_ids,
-            target_face_ids=target_face_ids,
-            valid_mask=valid_mask,
-            high_face_island=high_face_island,
-            n_low_faces=n_faces,
-            min_samples=int(seam_cfg.get("min_valid_samples_per_face", 2)),
-        )
-
-        seam_meta.update(
-            {
-                "uv_high_island_count": int(high_meta.get("high_island_count", 0)),
-                "uv_high_seam_edges": int(high_meta.get("high_seam_edges", 0)),
-                "uv_high_boundary_edges": int(high_meta.get("high_boundary_edges", 0)),
-                "uv_high_nonmanifold_edges": int(high_meta.get("high_nonmanifold_edges", 0)),
-            }
-        )
-
-    if island_guard_requested and high_face_island is not None:
-        sample_expected_island = low_face_island[sample_face_ids]
-        sample_expected_conf = low_face_confidence[sample_face_ids]
-        constrained_mask = (sample_expected_island >= 0) & (sample_expected_conf >= island_guard_conf_min)
-        constrained_idx = np.where(constrained_mask)[0]
-        constrained_n = int(constrained_idx.size)
-        guard_meta["uv_island_guard_enabled"] = constrained_n > 0
-        guard_meta["uv_island_guard_mode_used"] = island_guard_mode_requested if constrained_n > 0 else "off"
-        guard_meta["uv_island_guard_constrained_points"] = constrained_n
-        guard_meta["uv_island_guard_constrained_ratio"] = (
-            float(constrained_n / max(1, sample_face_ids.shape[0])) if sample_face_ids.size > 0 else 0.0
-        )
-
-        if constrained_n > 0:
-            guarded = correspond_points_hybrid(
-                points=sample_points[constrained_idx],
-                point_normals=sample_normals[constrained_idx],
-                corr_cfg=corr_cfg,
-                high_ctx=high_ctx,
-                island_guard={
-                    "enabled": True,
-                    "mode": island_guard_mode_requested,
-                    "allow_unknown": island_guard_allow_unknown,
-                    "high_face_island": high_face_island,
-                    "expected_island": sample_expected_island[constrained_idx],
-                },
-            )
-            target_uv[constrained_idx] = guarded["target_uv"]
-            target_face_ids[constrained_idx] = guarded["target_face_ids"]
-            valid_mask[constrained_idx] = guarded["valid_mask"]
-            primary_mask[constrained_idx] = guarded["primary_mask"]
-            fallback_used_mask[constrained_idx] = guarded["fallback_used_mask"]
-
-            guard_stats = guarded.get("island_guard_stats", {})
-            reject_count = int(guard_stats.get("reject_count", 0))
-            fallback_success_count = int(guard_stats.get("fallback_success_count", 0))
-            invalid_after_count = int(guard_stats.get("invalid_after_guard_count", 0))
-            guard_meta["uv_island_guard_reject_count"] = reject_count
-            guard_meta["uv_island_guard_reject_ratio"] = float(reject_count / max(1, constrained_n))
-            guard_meta["uv_island_guard_fallback_success_ratio"] = float(
-                fallback_success_count / max(1, constrained_n)
-            )
-            guard_meta["uv_island_guard_invalid_after_guard_ratio"] = float(
-                invalid_after_count / max(1, constrained_n)
-            )
-
-            low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
-                sample_face_ids=sample_face_ids,
-                target_face_ids=target_face_ids,
-                valid_mask=valid_mask,
-                high_face_island=high_face_island,
-                n_low_faces=n_faces,
-                min_samples=int(seam_cfg.get("min_valid_samples_per_face", 2)),
-            )
-
-    if high_face_island is not None:
-        seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
-        seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
-
-    if seam_strategy_used == "halfedge_island" and high_face_island is not None:
-        cut_edges = detect_cut_edges_from_face_labels(
-            np.asarray(low_mesh.faces, dtype=np.int64),
-            low_face_island,
-        )
-        split_vertices, split_faces, split_meta = split_vertices_along_cut_edges(
-            vertices=np.asarray(low_mesh.vertices, dtype=np.float32),
-            faces=np.asarray(low_mesh.faces, dtype=np.int64),
-            cut_edges=cut_edges,
-        )
-        if split_vertices.shape[0] != len(low_mesh.vertices):
-            solve_mesh = trimesh.Trimesh(vertices=split_vertices, faces=split_faces, process=False)
-        else:
-            solve_mesh = low_mesh
-        seam_meta["uv_low_cut_edges"] = int(split_meta.get("cut_edges", 0))
-        seam_meta["uv_low_split_vertices"] = int(split_meta.get("split_vertices_added", 0))
-        seam_meta["uv_low_split_faces"] = int(split_meta.get("split_faces", len(split_faces)))
-
-    if seam_strategy_used != "halfedge_island":
-        cross_seam_face_mask = detect_cross_seam_faces(
-            sample_face_ids=sample_face_ids,
-            target_uv=target_uv,
-            valid_mask=valid_mask,
             n_faces=n_faces,
-            uv_span_threshold=float(seam_cfg.get("uv_span_threshold", 0.35)),
+            corr_cfg=corr_cfg,
+            high_ctx=high_ctx,
+            high_face_island=high_face_island,
+            island_guard_requested=island_guard_requested,
+            island_guard_mode_requested=island_guard_mode_requested,
+            island_guard_mode_used=island_guard_mode_requested,
+            island_guard_allow_unknown=island_guard_allow_unknown,
+            island_guard_conf_min=island_guard_conf_min,
+            island_guard_fallback_policy=island_guard_fallback_policy,
+            expected_face_island=corr_pass["low_face_island"],
+            expected_face_confidence=corr_pass["low_face_confidence"],
+            fixed_face_island=None,
+            fixed_face_conflict=None,
+            fixed_face_confidence=None,
             min_valid_samples_per_face=int(seam_cfg.get("min_valid_samples_per_face", 2)),
+            guard_error=guard_error,
         )
-        solver_valid_mask = valid_mask.copy()
-        if bool(seam_cfg.get("exclude_cross_seam_faces", True)):
-            solver_valid_mask &= ~cross_seam_face_mask[sample_face_ids]
-        smooth_face_mask = ~cross_seam_face_mask
-        seam_meta["uv_cross_seam_faces"] = int(cross_seam_face_mask.sum())
-        seam_meta["uv_cross_seam_face_ratio"] = (
-            float(cross_seam_face_mask.mean()) if cross_seam_face_mask.size > 0 else 0.0
-        )
-        seam_meta["uv_seam_uv_span_threshold"] = float(seam_cfg.get("uv_span_threshold", 0.35))
 
-    if not np.any(solver_valid_mask):
-        mapped_uv, stats = barycentric_mapper(high_mesh, low_mesh, high_uv, resolved, cfg)
+    pass_inputs = _prepare_solver_inputs(
+        low_mesh=work_low_mesh,
+        sample_face_ids=sample_face_ids,
+        target_uv=corr_pass["target_uv"],
+        target_face_ids=corr_pass["target_face_ids"],
+        valid_mask=corr_pass["valid_mask"],
+        seam_cfg=seam_cfg,
+        seam_strategy_used=seam_strategy_used,
+        high_face_island=high_face_island,
+        low_face_island=corr_pass["low_face_island"],
+        low_face_conflict=corr_pass["low_face_conflict"],
+        unknown_face_policy="exclude",
+        seam_validation_strict=seam_validation_strict,
+        seam_validation_require_closed=seam_validation_require_closed,
+        seam_validation_require_pure_components=seam_validation_require_pure,
+    )
+
+    if not np.any(pass_inputs["solver_valid_mask"]):
+        fallback_mesh = work_low_mesh if seam_strategy_requested == "halfedge_island" else low_mesh
+        mapped_uv, stats = barycentric_mapper(high_mesh, fallback_mesh, high_uv, resolved, cfg)
         stats["uv_mode_used"] = "barycentric_fallback_no_valid_samples"
         stats["uv_project_error"] = "Hybrid correspondence had no valid samples after seam filtering"
         stats["uv_seam_strategy_used"] = seam_strategy_used
-        stats.update(seam_meta)
-        stats.update(guard_meta)
+        stats.update(seam_meta_seed)
+        stats.update(pass_inputs["seam_meta"])
+        stats.update(corr_pass["guard_meta"])
         stats["uv_iterative_enabled"] = False
         stats["uv_iter_count"] = 1
         stats["uv_iter_early_stop_reason"] = "iterative_disabled"
-        return mapped_uv, stats, {"local_vertex_split_applied": False, "quality_mesh": low_mesh}
+        return mapped_uv, stats, {"local_vertex_split_applied": False, "quality_mesh": fallback_mesh}
 
-    solve_face_ids = sample_face_ids[solver_valid_mask]
-    solve_bary = sample_bary[solver_valid_mask]
-    solve_target_uv = target_uv[solver_valid_mask]
-    solve_area_w = sample_area_weights[solver_valid_mask]
-
-    solve_corr_w = np.ones(len(solve_target_uv), dtype=np.float64)
-    fallback_in_solver = fallback_used_mask[solver_valid_mask]
-    solve_corr_w[fallback_in_solver] = float(corr_cfg["fallback_weight"])
-
-    tex_weight_cfg = cfg["texture_weight"]
-    if bool(tex_weight_cfg.get("enabled", True)) and image is not None:
-        tex_weights = texture_gradient_weights(
-            image=image,
-            uv=solve_target_uv,
-            gamma=float(tex_weight_cfg.get("grad_weight_gamma", 1.0)),
-            max_weight=float(tex_weight_cfg.get("max_weight", 5.0)),
-        )
-    else:
-        tex_weights = np.ones(len(solve_target_uv), dtype=np.float64)
-
-    weights = np.maximum(1e-12, solve_area_w * solve_corr_w * tex_weights)
-
-    solve_cfg = cfg["solve"]
-    pcg_max_iter = int(solve_cfg.get("pcg_max_iter", solve_cfg.get("cg_max_iter", 2000)))
-    pcg_tol = float(solve_cfg.get("pcg_tol", solve_cfg.get("cg_tol", 1e-6)))
-    mapped_uv, solve_meta = solve_global_uv(
-        low_mesh=solve_mesh,
-        sample_face_ids=solve_face_ids,
-        sample_bary=solve_bary,
-        target_uv=solve_target_uv,
-        sample_weights=weights,
-        backend=str(solve_cfg.get("backend", "auto")),
-        lambda_smooth=float(solve_cfg["lambda_smooth"]),
-        pcg_max_iter=pcg_max_iter,
-        pcg_tol=pcg_tol,
-        pcg_check_every=int(solve_cfg.get("pcg_check_every", 25)),
-        pcg_preconditioner=str(solve_cfg.get("pcg_preconditioner", "jacobi")),
-        anchor_weight=float(solve_cfg["anchor_weight"]),
-        ridge_eps=float(solve_cfg["ridge_eps"]),
+    solve_pass = _solve_pass(
         high_mesh=high_mesh,
         high_uv=high_uv,
-        smooth_face_mask=smooth_face_mask,
-        device=resolved,
+        image=image,
+        solve_mesh=pass_inputs["solve_mesh"],
+        sample_face_ids=sample_face_ids,
+        sample_bary=sample_bary,
+        sample_area_weights=sample_area_weights,
+        target_uv=corr_pass["target_uv"],
+        fallback_used_mask=corr_pass["fallback_used_mask"],
+        solver_valid_mask=pass_inputs["solver_valid_mask"],
+        smooth_face_mask=pass_inputs["smooth_face_mask"],
+        corr_cfg=corr_cfg,
+        solve_cfg=solve_cfg,
+        tex_weight_cfg=tex_weight_cfg,
+        resolved=resolved,
     )
 
-    pred_uv = interpolate_sample_uv(np.asarray(solve_mesh.faces, dtype=np.int64), solve_face_ids, solve_bary, mapped_uv)
-    color_l1, color_l2 = texture_reprojection_error(image, solve_target_uv, pred_uv)
+    if not solve_pass["ok"]:
+        fallback_mesh = work_low_mesh if seam_strategy_requested == "halfedge_island" else low_mesh
+        mapped_uv, stats = barycentric_mapper(high_mesh, fallback_mesh, high_uv, resolved, cfg)
+        stats["uv_mode_used"] = "barycentric_fallback_solver_error"
+        stats["uv_project_error"] = "Hybrid solve failed after seam preparation"
+        stats["uv_seam_strategy_used"] = seam_strategy_used
+        stats.update(seam_meta_seed)
+        stats.update(pass_inputs["seam_meta"])
+        stats.update(corr_pass["guard_meta"])
+        stats["uv_iterative_enabled"] = False
+        stats["uv_iter_count"] = 1
+        stats["uv_iter_early_stop_reason"] = "iterative_disabled"
+        return mapped_uv, stats, {"local_vertex_split_applied": False, "quality_mesh": fallback_mesh}
 
-    if seam_strategy_used != "halfedge_island":
-        seam_face_ids = np.where(cross_seam_face_mask)[0].astype(np.int64)
+    mapped_uv = solve_pass["mapped_uv"]
+    seam_face_ids = pass_inputs["seam_face_ids"]
+    seam_corner_uv = np.zeros((0, 3, 2), dtype=np.float32)
+    local_split_applied = False
     if seam_strategy_used != "halfedge_island" and bool(seam_cfg.get("local_vertex_split", True)) and seam_face_ids.size > 0:
-        low_faces = np.asarray(low_mesh.faces, dtype=np.int64)
-        low_verts = np.asarray(low_mesh.vertices, dtype=np.float32)
-        low_vn = get_vertex_normals(low_mesh)
+        low_faces = np.asarray(work_low_mesh.faces, dtype=np.int64)
+        low_verts = np.asarray(work_low_mesh.vertices, dtype=np.float32)
+        low_vn = get_vertex_normals(work_low_mesh)
 
         seam_corner_vid = low_faces[seam_face_ids]
         corner_points = low_verts[seam_corner_vid].reshape(-1, 3)
@@ -1014,16 +1082,17 @@ def _run_hybrid_legacy_once(
         local_split_applied = True
 
     method_stats = {
-        "uv_correspondence_primary_ratio": float(primary_mask.mean()) if primary_mask.size > 0 else 0.0,
-        "uv_correspondence_success_ratio": float(valid_mask.mean()) if valid_mask.size > 0 else 0.0,
-        "uv_correspondence_invalid_ratio": float((~valid_mask).mean()) if valid_mask.size > 0 else 0.0,
-        "uv_solve_num_samples": int(len(solve_target_uv)),
-        "uv_solve_valid_sample_ratio": float(solver_valid_mask.mean()) if solver_valid_mask.size > 0 else 0.0,
-        "uv_solve_num_faces": int(len(solve_mesh.faces)),
-        "uv_color_reproj_l1": color_l1,
-        "uv_color_reproj_l2": color_l2,
+        "uv_correspondence_primary_ratio": float(corr_pass["primary_mask"].mean()) if corr_pass["primary_mask"].size > 0 else 0.0,
+        "uv_correspondence_success_ratio": float(corr_pass["valid_mask"].mean()) if corr_pass["valid_mask"].size > 0 else 0.0,
+        "uv_correspondence_invalid_ratio": float((~corr_pass["valid_mask"]).mean()) if corr_pass["valid_mask"].size > 0 else 0.0,
+        "uv_solve_num_samples": int(len(solve_pass["solve_target_uv"])),
+        "uv_solve_valid_sample_ratio": float(pass_inputs["solver_valid_mask"].mean()) if pass_inputs["solver_valid_mask"].size > 0 else 0.0,
+        "uv_solve_num_faces": int(len(pass_inputs["solve_mesh"].faces)),
+        "uv_color_reproj_l1": solve_pass["color_l1"],
+        "uv_color_reproj_l2": solve_pass["color_l2"],
         "uv_local_vertex_split_faces": int(len(seam_face_ids)) if local_split_applied else 0,
         "uv_seam_strategy_requested": seam_strategy_requested,
+        "uv_seam_strategy_effective": seam_strategy_used,
         "uv_seam_strategy_used": seam_strategy_used,
         "uv_iterative_enabled": False,
         "uv_iter_count": 1,
@@ -1035,24 +1104,30 @@ def _run_hybrid_legacy_once(
         "uv_iter_guard_mode_used": [],
         "uv_iter_early_stop_reason": "iterative_disabled",
         "uv_iter_best_index": 1,
-        **seam_meta,
-        **guard_meta,
-        **solve_meta,
+        **seam_meta_seed,
+        **pass_inputs["seam_meta"],
+        **corr_pass["guard_meta"],
+        **solve_pass["solve_meta"],
     }
+    if bool(seam_cfg.get("emit_validation_sidecar_data", False)) and seam_strategy_used == "halfedge_island":
+        method_stats["uv_low_face_semantic_labels"] = np.asarray(
+            corr_pass["low_face_island"], dtype=np.int64
+        ).tolist()
+        method_stats["uv_low_seam_edges"] = np.asarray(pass_inputs["seam_edges"], dtype=np.int64).tolist()
     if seam_strategy_used == "halfedge_island":
         export_payload = {
             "local_vertex_split_applied": False,
             "halfedge_split_topology": True,
-            "split_vertices": np.asarray(solve_mesh.vertices, dtype=np.float32),
-            "split_faces": np.asarray(solve_mesh.faces, dtype=np.int64),
-            "quality_mesh": solve_mesh,
+            "split_vertices": np.asarray(pass_inputs["solve_mesh"].vertices, dtype=np.float32),
+            "split_faces": np.asarray(pass_inputs["solve_mesh"].faces, dtype=np.int64),
+            "quality_mesh": pass_inputs["solve_mesh"],
         }
     else:
         export_payload = {
             "local_vertex_split_applied": local_split_applied,
             "seam_face_ids": seam_face_ids,
             "seam_corner_uv": seam_corner_uv,
-            "quality_mesh": solve_mesh,
+            "quality_mesh": pass_inputs["solve_mesh"],
         }
     return mapped_uv, method_stats, export_payload
 

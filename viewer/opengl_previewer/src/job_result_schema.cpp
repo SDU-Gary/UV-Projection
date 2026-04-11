@@ -97,6 +97,9 @@ std::optional<std::string> TryParseString(const json &value) {
 template <typename T, typename Parser>
 void AssignField(const json &payload, const char *key, T FaithCJobResult::*member, FaithCJobResult &out,
                  Parser &&parser) {
+    if (key == nullptr) {
+        return;
+    }
     const auto it = payload.find(key);
     if (it == payload.end() || it->is_null()) {
         return;

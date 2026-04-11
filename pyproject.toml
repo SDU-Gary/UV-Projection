@@ -29,6 +29,8 @@ dependencies = [
     "trimesh",
     "numpy",
     "scipy",
+    "pymeshlab",
+    "openmesh",
     "torch_scatter",
     "einops",
     "atom3d",

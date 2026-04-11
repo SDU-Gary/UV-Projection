@@ -11,6 +11,7 @@ from scipy.sparse import coo_matrix, csr_matrix, diags
 from ..halfedge_topology import (
     compute_high_face_uv_islands,
     detect_cut_edges_from_face_labels,
+    split_vertices_along_cut_edges,
 )
 from .correspondence import (
     build_high_cuda_context,
@@ -18,6 +19,9 @@ from .correspondence import (
     detect_cross_seam_faces,
     major_face_island_labels,
 )
+from .mesh_sanitizer import ensure_halfedge_external_dependencies, sanitize_mesh_for_halfedge
+from .openmesh_seams import extract_seam_edges_openmesh, validate_face_partition_by_seams
+from .semantic_transfer import transfer_face_semantics_by_projection
 from .linear_solver import (
     build_cuda_sparse_system,
     connected_components_labels,
@@ -29,7 +33,6 @@ from .linear_solver import (
 )
 from .quality import texture_gradient_weights, texture_reprojection_error
 from .sampling import sample_low_mesh
-from .seam_routing import route_low_mesh_seams_by_dijkstra
 from .texture_io import resolve_device
 
 _HIGH_ISLAND_CACHE: Dict[Tuple[int, int, int, int, int, float, float], Tuple[np.ndarray, Dict[str, int]]] = {}
@@ -1255,12 +1258,18 @@ def run_method2_gradient_poisson(
     ],
     return_internal: bool = False,
 ):
-    sample = sample_low_mesh(low_mesh, cfg["sample"])
-    sample_points = sample["points"]
-    sample_face_ids = sample["face_ids"]
-    sample_bary = sample["bary"]
-    sample_normals = sample["normals"]
-    sample_area_weights = sample["area_weights"]
+    corr_cfg = cfg["correspondence"]
+    seam_cfg = cfg.get("seam", {})
+    solve_cfg = cfg["solve"]
+    tex_weight_cfg = cfg.get("texture_weight", {})
+    m2_cfg = cfg.get("method2", {})
+    seam_strategy_requested = str(seam_cfg.get("strategy", "legacy")).strip().lower()
+    if seam_strategy_requested not in {"legacy", "halfedge_island"}:
+        seam_strategy_requested = "legacy"
+    emit_validation_sidecar_data = bool(seam_cfg.get("emit_validation_sidecar_data", False))
+    seam_validation_strict = bool(seam_cfg.get("validation_strict", True))
+    seam_require_closed = bool(seam_cfg.get("validation_require_closed_loops", True))
+    seam_require_partition_pure = bool(seam_cfg.get("validation_require_pure_components", True))
 
     resolved = resolve_device(device)
     if resolved != "cuda":
@@ -1279,11 +1288,19 @@ def run_method2_gradient_poisson(
             return_internal=return_internal,
         )
 
-    corr_cfg = cfg["correspondence"]
-    seam_cfg = cfg.get("seam", {})
-    solve_cfg = cfg["solve"]
-    tex_weight_cfg = cfg.get("texture_weight", {})
-    m2_cfg = cfg.get("method2", {})
+    work_low_mesh = low_mesh
+    pre_seam_meta: Dict[str, Any] = {}
+    if seam_strategy_requested == "halfedge_island":
+        ensure_halfedge_external_dependencies()
+        work_low_mesh, sanitize_meta = sanitize_mesh_for_halfedge(low_mesh=low_mesh, seam_cfg=seam_cfg)
+        pre_seam_meta.update(sanitize_meta)
+
+    sample = sample_low_mesh(work_low_mesh, cfg["sample"])
+    sample_points = sample["points"]
+    sample_face_ids = sample["face_ids"]
+    sample_bary = sample["bary"]
+    sample_normals = sample["normals"]
+    sample_area_weights = sample["area_weights"]
 
     high_ctx = build_high_cuda_context(high_mesh=high_mesh, high_uv=high_uv, device=resolved)
     correspondence = correspond_points_hybrid(
@@ -1298,11 +1315,11 @@ def run_method2_gradient_poisson(
     primary_mask = correspondence["primary_mask"]
     fallback_used_mask = correspondence["fallback_used_mask"]
 
-    n_faces = int(len(low_mesh.faces))
-    solve_mesh = low_mesh
+    n_faces = int(len(work_low_mesh.faces))
+    solve_mesh = work_low_mesh
     face_active_mask = np.ones((n_faces,), dtype=np.bool_)
     solver_valid_mask = valid_mask.copy()
-    seam_strategy_requested = str(seam_cfg.get("strategy", "legacy"))
+    seam_strategy_effective = seam_strategy_requested
     seam_strategy_used = "method2_ideal_noguard"
     split_vertices_out: Optional[np.ndarray] = None
     split_faces_out: Optional[np.ndarray] = None
@@ -1313,10 +1330,16 @@ def run_method2_gradient_poisson(
     low_face_conflict = np.zeros((n_faces,), dtype=np.bool_)
     low_face_confidence = np.zeros((n_faces,), dtype=np.float32)
     low_face_expected_high = np.full((n_faces,), -1, dtype=np.int64)
+    seam_edges_for_export = np.zeros((0, 2), dtype=np.int64)
     seam_meta: Dict[str, Any] = {}
+    seam_meta.update(pre_seam_meta)
     seam_meta["uv_island_conflict_policy"] = "drop_conflict_and_unknown_samples"
     seam_meta["uv_halfedge_split_requested"] = bool(seam_strategy_requested == "halfedge_island")
     seam_meta["uv_halfedge_split_topology_applied"] = False
+    seam_meta["uv_halfedge_split_fallback_to_legacy"] = False
+    seam_meta["uv_seam_validation_strict"] = bool(seam_validation_strict)
+    seam_meta["uv_seam_validation_require_closed_loops"] = bool(seam_require_closed)
+    seam_meta["uv_seam_validation_require_pure_components"] = bool(seam_require_partition_pure)
     island_cache_enabled = bool(m2_cfg.get("perf_fast_island_cache", True))
     seam_meta["uv_m2_perf_high_island_cache_enabled"] = island_cache_enabled
     seam_meta["uv_m2_perf_high_island_cache_hit"] = False
@@ -1336,88 +1359,119 @@ def run_method2_gradient_poisson(
     except Exception as exc:
         seam_meta["uv_high_island_error"] = str(exc)
 
-    if high_face_island is not None:
-        if seam_strategy_requested == "halfedge_island":
-            try:
-                routed = route_low_mesh_seams_by_dijkstra(
-                    high_mesh=high_mesh,
-                    high_uv=high_uv,
-                    low_mesh=low_mesh,
-                    sample_face_ids=sample_face_ids,
-                    target_face_ids=target_face_ids,
-                    valid_mask=valid_mask,
-                    high_face_island=high_face_island,
-                    seam_cfg=seam_cfg,
-                )
-                low_face_island = np.asarray(routed.low_face_island, dtype=np.int64, copy=False)
-                low_face_conflict = np.asarray(routed.low_face_conflict, dtype=np.bool_, copy=False)
-                low_face_confidence = np.asarray(routed.low_face_confidence, dtype=np.float32, copy=False)
-                low_face_expected_high = np.asarray(
-                    routed.low_face_expected_high_island, dtype=np.int64, copy=False
-                )
-                split_vertices = np.asarray(routed.split_vertices, dtype=np.float32, copy=False)
-                split_faces = np.asarray(routed.split_faces, dtype=np.int64, copy=False)
-                split_meta = dict(routed.split_meta)
-                seam_meta.update(dict(routed.route_meta))
-                seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
-                seam_meta["uv_island_conflict_faces_excluded"] = 0
-                seam_meta["uv_low_cut_edges"] = int(split_meta.get("cut_edges", routed.cut_edges.shape[0]))
-                seam_meta["uv_low_split_vertices"] = int(split_meta.get("split_vertices_added", 0))
-                seam_meta["uv_low_split_faces"] = int(split_meta.get("split_faces", n_faces))
-                if int(split_vertices.shape[0]) > int(len(low_mesh.vertices)):
-                    solve_mesh = trimesh.Trimesh(vertices=split_vertices, faces=split_faces, process=False)
-                    split_vertices_out = split_vertices
-                    split_faces_out = split_faces
-                    seam_meta["uv_halfedge_split_topology_applied"] = True
-                seam_strategy_used = "method2_halfedge_dijkstra_noguard"
-            except Exception as exc:
-                seam_meta["uv_halfedge_island_error"] = str(exc)
-                low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
-                    sample_face_ids=sample_face_ids,
-                    target_face_ids=target_face_ids,
-                    valid_mask=valid_mask,
-                    high_face_island=high_face_island,
-                    n_low_faces=n_faces,
-                    min_samples=int(seam_cfg.get("min_valid_samples_per_face", 2)),
-                )
-                low_face_expected_high = low_face_island.astype(np.int64, copy=False)
-                seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
-                seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
-                seam_meta["uv_island_conflict_faces_excluded"] = 0
-                seam_meta["uv_low_cut_edges"] = 0
-                seam_meta["uv_low_split_vertices"] = 0
-                seam_meta["uv_low_split_faces"] = int(n_faces)
-                seam_strategy_used = "method2_ideal_noguard"
-        else:
-            low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
-                sample_face_ids=sample_face_ids,
-                target_face_ids=target_face_ids,
-                valid_mask=valid_mask,
-                high_face_island=high_face_island,
-                n_low_faces=n_faces,
-                min_samples=int(seam_cfg.get("min_valid_samples_per_face", 2)),
+    if high_face_island is None and seam_strategy_requested == "halfedge_island":
+        if seam_validation_strict:
+            raise RuntimeError("halfedge_island failed: unable to compute high-face UV islands")
+        mapped_uv, stats = barycentric_mapper(high_mesh, work_low_mesh, high_uv, resolved, cfg)
+        stats["uv_mode_used"] = "method2_fallback_halfedge_island_error"
+        stats["uv_project_error"] = "halfedge_island failed: unable to compute high-face UV islands"
+        stats["uv_seam_strategy_requested"] = seam_strategy_requested
+        stats["uv_seam_strategy_effective"] = "halfedge_island_failed"
+        stats["uv_seam_strategy_used"] = "method2_halfedge_failed"
+        stats.update(seam_meta)
+        return _package_method2_result(
+            mapped_uv=mapped_uv,
+            stats=stats,
+            quality_mesh=work_low_mesh,
+            return_internal=return_internal,
+        )
+
+    if high_face_island is not None and seam_strategy_requested == "halfedge_island":
+        seam_strategy_effective = "halfedge_island"
+        semantic = transfer_face_semantics_by_projection(
+            high_ctx=high_ctx,
+            high_face_island=high_face_island,
+            low_mesh=work_low_mesh,
+            seam_cfg=seam_cfg,
+            corr_cfg=corr_cfg,
+        )
+        low_face_island = np.asarray(semantic["low_face_island"], dtype=np.int64, copy=False)
+        low_face_conflict = np.asarray(semantic["low_face_conflict"], dtype=np.bool_, copy=False)
+        low_face_confidence = np.asarray(semantic["low_face_confidence"], dtype=np.float32, copy=False)
+        low_face_expected_high = low_face_island.astype(np.int64, copy=False)
+        seam_meta.update(dict(semantic.get("meta", {})))
+        seam_meta["uv_halfedge_backend"] = "openmesh"
+
+        seam_result = extract_seam_edges_openmesh(
+            low_mesh=work_low_mesh,
+            face_labels=low_face_island,
+            include_boundary_as_seam=bool(seam_cfg.get("include_boundary_as_seam", False)),
+        )
+        seam_edges = np.asarray(seam_result.seam_edges, dtype=np.int64, copy=False)
+        seam_edges_for_export = seam_edges.astype(np.int64, copy=False)
+        seam_meta.update(dict(seam_result.meta))
+        partition_meta = validate_face_partition_by_seams(
+            low_mesh=work_low_mesh,
+            face_labels=low_face_island,
+            seam_edges=seam_edges,
+        )
+        seam_meta.update(partition_meta)
+        seam_topology_ok = bool(seam_result.meta.get("uv_seam_topology_valid", False)) or (not seam_require_closed)
+        seam_partition_ok = bool(partition_meta.get("uv_seam_partition_is_valid", False)) or (
+            not seam_require_partition_pure
+        )
+        seam_validation_ok = bool(seam_topology_ok and seam_partition_ok)
+        seam_meta["uv_seam_validation_ok"] = bool(seam_validation_ok)
+        if not seam_validation_ok:
+            seam_meta["uv_seam_validation_error"] = (
+                f"topology_ok={seam_topology_ok}, partition_ok={seam_partition_ok}, "
+                f"components_open={int(seam_result.meta.get('uv_seam_components_open', 0))}, "
+                f"mixed_components={int(partition_meta.get('uv_seam_partition_mixed_components', 0))}"
             )
-            low_face_expected_high = low_face_island.astype(np.int64, copy=False)
-            seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
-            seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
-            seam_meta["uv_island_conflict_faces_excluded"] = 0
-            fast_cut_diag = bool(m2_cfg.get("perf_fast_cut_edge_count", True))
-            seam_meta["uv_m2_perf_fast_cut_edge_count"] = bool(fast_cut_diag)
-            if fast_cut_diag:
-                seam_meta["uv_low_cut_edges"] = int(
-                    _count_cut_edges_from_face_labels_fast(
-                        np.asarray(low_mesh.faces, dtype=np.int64),
-                        low_face_island,
-                    )
+            if seam_validation_strict:
+                raise RuntimeError(f"halfedge seam validation failed: {seam_meta['uv_seam_validation_error']}")
+
+        split_vertices, split_faces, split_meta = split_vertices_along_cut_edges(
+            vertices=np.asarray(work_low_mesh.vertices, dtype=np.float32),
+            faces=np.asarray(work_low_mesh.faces, dtype=np.int64),
+            cut_edges=seam_edges,
+        )
+        seam_meta["uv_low_cut_edges"] = int(split_meta.get("cut_edges", seam_edges.shape[0]))
+        seam_meta["uv_low_split_vertices"] = int(split_meta.get("split_vertices_added", 0))
+        seam_meta["uv_low_split_faces"] = int(split_meta.get("split_faces", n_faces))
+        seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
+        seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
+        seam_meta["uv_island_conflict_faces_excluded"] = 0
+        if int(split_vertices.shape[0]) > int(len(work_low_mesh.vertices)):
+            solve_mesh = trimesh.Trimesh(vertices=split_vertices, faces=split_faces, process=False)
+            split_vertices_out = split_vertices
+            split_faces_out = split_faces
+            seam_meta["uv_halfedge_split_topology_applied"] = True
+        seam_strategy_used = "method2_halfedge_semantic_openmesh"
+    elif high_face_island is not None:
+        low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
+            sample_face_ids=sample_face_ids,
+            target_face_ids=target_face_ids,
+            valid_mask=valid_mask,
+            high_face_island=high_face_island,
+            n_low_faces=n_faces,
+            min_samples=int(seam_cfg.get("min_valid_samples_per_face", 2)),
+        )
+        low_face_expected_high = low_face_island.astype(np.int64, copy=False)
+        seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
+        seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
+        seam_meta["uv_island_conflict_faces_excluded"] = 0
+        fast_cut_diag = bool(m2_cfg.get("perf_fast_cut_edge_count", True))
+        seam_meta["uv_m2_perf_fast_cut_edge_count"] = bool(fast_cut_diag)
+        if fast_cut_diag:
+            seam_meta["uv_low_cut_edges"] = int(
+                _count_cut_edges_from_face_labels_fast(
+                    np.asarray(work_low_mesh.faces, dtype=np.int64),
+                    low_face_island,
                 )
-            else:
-                try:
-                    cut_edges = detect_cut_edges_from_face_labels(np.asarray(low_mesh.faces, dtype=np.int64), low_face_island)
-                    seam_meta["uv_low_cut_edges"] = int(len(cut_edges))
-                except Exception:
-                    seam_meta["uv_low_cut_edges"] = 0
-            seam_meta["uv_low_split_vertices"] = 0
-            seam_meta["uv_low_split_faces"] = int(n_faces)
+            )
+        else:
+            try:
+                cut_edges = detect_cut_edges_from_face_labels(
+                    np.asarray(work_low_mesh.faces, dtype=np.int64),
+                    low_face_island,
+                )
+                seam_meta["uv_low_cut_edges"] = int(len(cut_edges))
+            except Exception:
+                seam_meta["uv_low_cut_edges"] = 0
+        seam_meta["uv_low_split_vertices"] = 0
+        seam_meta["uv_low_split_faces"] = int(n_faces)
+        seam_strategy_used = "method2_ideal_noguard"
     else:
         seam_meta.setdefault("uv_island_conflict_faces", 0)
         seam_meta.setdefault("uv_island_unknown_faces", int(n_faces))
@@ -1427,7 +1481,7 @@ def run_method2_gradient_poisson(
         seam_meta.setdefault("uv_low_split_faces", int(n_faces))
         low_face_expected_high = low_face_island.astype(np.int64, copy=False)
 
-    if seam_strategy_requested == "halfedge_island":
+    if seam_strategy_effective == "halfedge_island":
         cross_seam_face_mask = np.zeros((n_faces,), dtype=np.bool_)
         seam_meta["uv_cross_seam_faces"] = 0
         seam_meta["uv_cross_seam_face_ratio"] = 0.0
@@ -1544,7 +1598,7 @@ def run_method2_gradient_poisson(
         face_accepted_samples = np.bincount(sf_all[valid_for_accept], minlength=n_faces).astype(np.int32, copy=False)
 
     if not np.any(solver_valid_mask):
-        mapped_uv, stats = nearest_mapper(high_mesh, low_mesh, high_uv)
+        mapped_uv, stats = nearest_mapper(high_mesh, work_low_mesh, high_uv)
         stats["uv_mode_used"] = "nearest_fallback_no_valid_samples"
         stats["uv_project_error"] = "method2_gradient_poisson has no valid correspondence samples"
         stats["uv_m2_jacobian_valid_ratio"] = 0.0
@@ -1561,7 +1615,7 @@ def run_method2_gradient_poisson(
         return _package_method2_result(
             mapped_uv=mapped_uv,
             stats=stats,
-            quality_mesh=low_mesh,
+            quality_mesh=work_low_mesh,
             return_internal=return_internal,
         )
 
@@ -1712,7 +1766,7 @@ def run_method2_gradient_poisson(
     )
 
     if np.count_nonzero(face_valid) == 0 or A.shape[0] == 0:
-        mapped_uv, stats = barycentric_mapper(high_mesh, low_mesh, high_uv, resolved, cfg)
+        mapped_uv, stats = barycentric_mapper(high_mesh, solve_mesh, high_uv, resolved, cfg)
         stats["uv_mode_used"] = "method2_fallback_no_gradient_constraints"
         stats["uv_project_error"] = (
             "method2_gradient_poisson has no valid gradient constraints"
@@ -1736,7 +1790,7 @@ def run_method2_gradient_poisson(
         return _package_method2_result(
             mapped_uv=mapped_uv,
             stats=stats,
-            quality_mesh=low_mesh,
+            quality_mesh=solve_mesh,
             return_internal=return_internal,
         )
 
@@ -1790,7 +1844,7 @@ def run_method2_gradient_poisson(
             )
             solve_meta["uv_m2_solve_per_island_enabled"] = False
     except Exception as exc:
-        mapped_uv, stats = barycentric_mapper(high_mesh, low_mesh, high_uv, resolved, cfg)
+        mapped_uv, stats = barycentric_mapper(high_mesh, solve_mesh, high_uv, resolved, cfg)
         stats["uv_mode_used"] = "method2_fallback_solver_error"
         stats["uv_project_error"] = f"method2 solver failed: {exc}"
         stats["uv_m2_jacobian_valid_ratio"] = float(np.count_nonzero(face_valid) / max(1, n_faces))
@@ -1810,7 +1864,7 @@ def run_method2_gradient_poisson(
         return _package_method2_result(
             mapped_uv=mapped_uv,
             stats=stats,
-            quality_mesh=low_mesh,
+            quality_mesh=solve_mesh,
             return_internal=return_internal,
         )
     solve_stage_seconds = float(time.perf_counter() - t_solve_start)
@@ -1863,6 +1917,7 @@ def run_method2_gradient_poisson(
         "uv_color_reproj_l1": color_l1,
         "uv_color_reproj_l2": color_l2,
         "uv_seam_strategy_requested": seam_strategy_requested,
+        "uv_seam_strategy_effective": seam_strategy_effective,
         "uv_seam_strategy_used": seam_strategy_used,
         "uv_iterative_enabled": False,
         "uv_iter_count": 1,
@@ -1920,6 +1975,9 @@ def run_method2_gradient_poisson(
         method_stats["uv_m2_face_accepted_samples"] = face_accepted_samples.tolist()
         if face_total_samples is not None:
             method_stats["uv_m2_face_total_samples"] = face_total_samples.tolist()
+    if emit_validation_sidecar_data and seam_strategy_effective == "halfedge_island":
+        method_stats["uv_low_face_semantic_labels"] = low_face_island.astype(np.int64, copy=False).tolist()
+        method_stats["uv_low_seam_edges"] = seam_edges_for_export.astype(np.int64, copy=False).tolist()
 
     export_payload: Dict[str, Any] = {
         "local_vertex_split_applied": False,
@@ -1929,6 +1987,18 @@ def run_method2_gradient_poisson(
         export_payload["halfedge_split_topology"] = True
         export_payload["split_vertices"] = split_vertices_out.astype(np.float32, copy=False)
         export_payload["split_faces"] = split_faces_out.astype(np.int64, copy=False)
+    elif (
+        seam_strategy_effective == "halfedge_island"
+        and (
+            int(len(solve_mesh.vertices)) != int(len(low_mesh.vertices))
+            or int(len(solve_mesh.faces)) != int(len(low_mesh.faces))
+        )
+    ):
+        # Sanitization can already alter topology (e.g., split non-manifold vertices).
+        # Export the actual solve mesh to keep UV/vertex indexing consistent.
+        export_payload["halfedge_split_topology"] = True
+        export_payload["split_vertices"] = np.asarray(solve_mesh.vertices, dtype=np.float32)
+        export_payload["split_faces"] = np.asarray(solve_mesh.faces, dtype=np.int64)
 
     if not return_internal:
         return mapped_uv, method_stats, export_payload

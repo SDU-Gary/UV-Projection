@@ -196,6 +196,21 @@ class UVProjector:
         image,
         export_payload: Optional[Dict[str, Any]] = None,
     ) -> trimesh.Trimesh:
+        if export_payload is not None:
+            payload_quality_mesh = export_payload.get("quality_mesh")
+            if isinstance(payload_quality_mesh, trimesh.Trimesh):
+                qv = int(len(payload_quality_mesh.vertices))
+                qf = int(len(payload_quality_mesh.faces))
+                lv = int(len(low_mesh.vertices))
+                lf = int(len(low_mesh.faces))
+                if np.asarray(mapped_uv).shape[0] == qv and (qv != lv or qf != lf):
+                    uv_mesh = payload_quality_mesh.copy()
+                    uv_mesh.visual = trimesh.visual.texture.TextureVisuals(
+                        uv=np.asarray(mapped_uv, dtype=np.float32),
+                        image=image,
+                    )
+                    return uv_mesh
+
         if export_payload is not None and bool(export_payload.get("halfedge_split_topology", False)):
             split_vertices = np.asarray(export_payload.get("split_vertices", []), dtype=np.float32)
             split_faces = np.asarray(export_payload.get("split_faces", []), dtype=np.int64)

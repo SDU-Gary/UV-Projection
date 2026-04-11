@@ -26,6 +26,7 @@ if SRC_ROOT.exists():
 from faithcontour import FCTDecoder, FCTEncoder
 from faithc_infra.profiler import ExecutionProfiler, ProfilerConfig
 from faithc_infra.services.uv_projector import UVProjector
+from faithc_infra.services.uv.closure_validation import run_uv_closure_validation
 from faithc_infra.services.uv.texture_io import resolve_device
 
 
@@ -90,7 +91,7 @@ def _write_method2_face_samples_sidecar(status_path: Path, payload: Dict[str, An
     if total is not None:
         sidecar_payload["total"] = total.astype(int).tolist()
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(json.dumps(sidecar_payload, indent=2), encoding="utf-8")
+    sidecar.write_text(json.dumps(sidecar_payload, separators=(",", ":")), encoding="utf-8")
 
     nonzero = int(np.count_nonzero(accepted))
     vmax = int(np.max(accepted)) if accepted.size > 0 else 0
@@ -101,6 +102,75 @@ def _write_method2_face_samples_sidecar(status_path: Path, payload: Dict[str, An
         "uv_m2_face_sample_max": vmax,
     }
 
+
+def _write_uv_closure_validation_sidecar(
+    *,
+    status_path: Path,
+    payload: Dict[str, Any],
+    high_mesh: trimesh.Trimesh,
+    low_mesh: trimesh.Trimesh,
+    uv_options: Dict[str, Any],
+) -> Dict[str, Any]:
+    low_labels_raw = payload.pop("uv_low_face_semantic_labels", None)
+    low_seam_edges_raw = payload.pop("uv_low_seam_edges", None)
+
+    low_face_labels = None
+    if low_labels_raw is not None:
+        low_face_labels = np.asarray(low_labels_raw, dtype=np.int64).reshape(-1)
+    low_seam_edges = None
+    if low_seam_edges_raw is not None:
+        low_seam_edges = np.asarray(low_seam_edges_raw, dtype=np.int64).reshape(-1, 2)
+
+    seam_cfg = uv_options.get("seam", {})
+    out_png = status_path.parent / f"{status_path.stem}.uv_closure_validation.png"
+    out_sidecar = status_path.parent / f"{status_path.stem}.uv_closure_validation.json"
+
+    try:
+        result = run_uv_closure_validation(
+            high_mesh=high_mesh,
+            low_mesh=low_mesh,
+            low_face_labels=low_face_labels,
+            low_seam_edges=low_seam_edges,
+            high_position_eps=float(seam_cfg.get("high_position_eps", 1e-6)),
+            high_uv_eps=float(seam_cfg.get("high_uv_eps", 1e-5)),
+            output_png=out_png,
+            overlap_raster_res=int(seam_cfg.get("validation_overlap_raster_res", 256)),
+        )
+    except Exception as exc:
+        return {
+            "uv_closure_validation_error": str(exc),
+        }
+
+    sidecar_payload: Dict[str, Any] = {
+        "semantic_labels": np.asarray(result.low_face_labels, dtype=np.int64).astype(int).tolist(),
+        "seam_edges": np.asarray(result.low_seam_edges, dtype=np.int64).astype(int).tolist(),
+        "summary": dict(result.metrics),
+        "uv_validation_png": result.image_path,
+        "uv_validation_png_error": result.image_error,
+    }
+    out_sidecar.parent.mkdir(parents=True, exist_ok=True)
+    out_sidecar.write_text(json.dumps(sidecar_payload, separators=(",", ":")), encoding="utf-8")
+
+    summary = result.metrics
+    return {
+        "uv_closure_validation_sidecar_path": str(out_sidecar),
+        "uv_closure_validation_png_path": str(result.image_path) if result.image_path else "",
+        "uv_closure_validation_png_error": result.image_error or "",
+        "uv_closure_partition_has_leakage": bool(summary.get("partition_has_leakage", False)),
+        "uv_closure_partition_mixed_components": int(summary.get("partition_mixed_components", -1)),
+        "uv_closure_partition_label_split_count": int(summary.get("partition_label_split_count", -1)),
+        "uv_closure_seam_topology_valid": bool(summary.get("seam_topology_valid", False)),
+        "uv_closure_seam_components": int(summary.get("seam_components", -1)),
+        "uv_closure_seam_loops_closed": int(summary.get("seam_loops_closed", -1)),
+        "uv_closure_seam_components_open": int(summary.get("seam_components_open", -1)),
+        "uv_closure_low_island_count": int(summary.get("low_island_count", -1)),
+        "uv_closure_high_island_count": int(summary.get("high_island_count", -1)),
+        "uv_closure_semantic_unknown_faces": int(summary.get("semantic_unknown_faces", -1)),
+        "uv_closure_uv_bbox_iou_mean": float(summary.get("uv_bbox_iou_mean", 0.0)),
+        "uv_closure_uv_overlap_ratio": float(summary.get("uv_overlap_ratio", 0.0)),
+        "uv_closure_uv_stretch_p95": float(summary.get("uv_stretch_p95", 0.0)),
+        "uv_closure_uv_stretch_p99": float(summary.get("uv_stretch_p99", 0.0)),
+    }
 
 def _profile_step(profiler: ExecutionProfiler | None, name: str):
     return profiler.step(name) if profiler is not None else nullcontext()
@@ -432,6 +502,8 @@ def run_pipeline(
                 "uv_span_threshold": float(args.uv_seam_uv_span_threshold),
                 "min_valid_samples_per_face": int(args.uv_seam_min_valid_samples),
                 "exclude_cross_seam_faces": bool(args.uv_exclude_cross_seam_faces),
+                "emit_validation_sidecar_data": True,
+                "validation_overlap_raster_res": 128,
                 "local_vertex_split": bool(args.uv_local_vertex_split),
                 "uv_island_guard_enabled": bool(args.uv_island_guard),
                 "uv_island_guard_mode": str(args.uv_island_guard_mode),
@@ -512,6 +584,15 @@ def run_pipeline(
             )
             if status_path is not None:
                 uv_diag.update(_write_method2_face_samples_sidecar(status_path, uv_diag))
+                uv_diag.update(
+                    _write_uv_closure_validation_sidecar(
+                        status_path=status_path,
+                        payload=uv_diag,
+                        high_mesh=mesh,
+                        low_mesh=export_mesh,
+                        uv_options=uv_options,
+                    )
+                )
 
     with _profile_step(profiler, "preview:export_mesh"):
         out_path.parent.mkdir(parents=True, exist_ok=True)

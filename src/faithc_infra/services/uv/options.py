@@ -56,7 +56,21 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
         "local_vertex_split": True,
         "high_position_eps": 1e-6,
         "high_uv_eps": 1e-5,
-        # Dijkstra seam routing (used when strategy=halfedge_island).
+        # halfedge_island pipeline controls (Mesh sanitization + semantic transfer).
+        "sanitize_enabled": True,
+        "sanitize_area_eps": 1e-12,
+        "transfer_max_normal_angle_deg": 30.0,
+        "transfer_fill_unknown_iters": 2,
+        "transfer_majority_vote_iters": 1,
+        "transfer_morph_close_iters": 2,
+        "include_boundary_as_seam": False,
+        "validation_strict": True,
+        "validation_require_closed_loops": True,
+        "validation_require_pure_components": True,
+        # Compatibility-only keys below are retained to avoid breaking old configs.
+        # Some legacy routing keys are no longer used by the maintained pipeline.
+        "routing_mode": "point_cloud_mask",
+        # Legacy routing compatibility params (ignored).
         "routing_weight_dist": 3.0,
         "routing_weight_align": 1.5,
         "routing_weight_length": 1.0,
@@ -71,10 +85,29 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
         # Penalize reusing routed low edges across chains.
         "routing_edge_reuse_penalty": 2.0,
         "routing_edge_reuse_power": 1.0,
+        "routing_path_outlier_ratio": 5.0,
         "routing_anchor_spacing_ratio": 8.0,
         "routing_min_anchors": 8,
         "routing_max_anchors": 128,
         "routing_island_confidence_min": 0.55,
+        # Legacy point-cloud mask compatibility params (ignored).
+        "mask_seed_knn_edges": 2,
+        "mask_seed_sigma_ratio": 1.0,
+        "mask_seed_max_dist_ratio": 0.6,
+        "mask_seed_min_support": 1,
+        "mask_closing_rounds": 2,
+        "mask_closing_dist_ratio": 1.25,
+        "mask_closing_max_add_ratio": 0.25,
+        "mask_band_outside_multiplier": 100.0,
+        "mask_min_component_edges": 1,
+        "mask_cost_seed_bonus": 2.0,
+        "mask_cost_inactive_penalty": 50.0,
+        "mask_skeleton_seed_bonus": 4.0,
+        "mask_skeleton_anchor_use_junctions": True,
+        "mask_skeleton_anchor_spacing_ratio": 8.0,
+        "mask_skeleton_min_anchors": 8,
+        "mask_skeleton_max_anchors": 128,
+        "mask_skeleton_fallback_to_band": True,
         # Guard correspondence against cross-island matches before global UV solve.
         "uv_island_guard_enabled": True,
         "uv_island_guard_mode": "soft",
