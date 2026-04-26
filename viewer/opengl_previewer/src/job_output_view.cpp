@@ -170,6 +170,10 @@ Section BuildGeneralResultSection(const FaithCJobResult &r) {
     AddRow(section.rows, "UV Mode Used", UnknownIfEmpty(r.uv_mode_used));
     AddRowIf(section.rows, "UV Seam Strategy Req/Used",
              PairRowIfAny(r.uv_seam_strategy_requested, r.uv_seam_strategy_used));
+    if (!r.uv_island_validation_mode.empty()) {
+        AddRow(section.rows, "UV Island Validation",
+               r.uv_island_validation_mode + " / " + YesNo(r.uv_island_validation_ok));
+    }
     AddRowIf(section.rows, "UV Solver Backend Req/Used",
              PairRowIfAny(r.uv_solver_backend_requested, r.uv_solver_backend_used));
     AddRowIf(section.rows, "UV Linear Solver Req/Used",
@@ -322,6 +326,24 @@ Section BuildSeamSection(const FaithCJobResult &r) {
                std::to_string(r.uv_island_conflict_faces) + " / " + std::to_string(r.uv_island_unknown_faces) + " / " +
                    std::to_string(r.uv_island_conflict_faces_excluded));
     }
+    if (r.uv_semantic_component_merge_min_faces >= 0 || r.uv_semantic_component_merge_merged_components >= 0 ||
+        r.uv_semantic_component_merge_merged_faces >= 0) {
+        AddRow(section.rows, "Component Merge Enabled/MinFaces",
+               std::string(YesNo(r.uv_semantic_component_merge_enabled)) + " / " +
+                   std::to_string(r.uv_semantic_component_merge_min_faces));
+        AddRow(section.rows, "Component Merge MergedComp/Faces",
+               std::to_string(r.uv_semantic_component_merge_merged_components) + " / " +
+                   std::to_string(r.uv_semantic_component_merge_merged_faces));
+    }
+    if (r.uv_semantic_pre_cleanup_fragmented_label_count >= 0 || r.uv_semantic_pre_cleanup_severe_label_count >= 0 ||
+        r.uv_semantic_final_fragmented_label_count >= 0 || r.uv_semantic_final_severe_label_count >= 0) {
+        AddRow(section.rows, "Semantic Frag/Severe PreCleanup",
+               std::to_string(r.uv_semantic_pre_cleanup_fragmented_label_count) + " / " +
+                   std::to_string(r.uv_semantic_pre_cleanup_severe_label_count));
+        AddRow(section.rows, "Semantic Frag/Severe Final",
+               std::to_string(r.uv_semantic_final_fragmented_label_count) + " / " +
+                   std::to_string(r.uv_semantic_final_severe_label_count));
+    }
     if (r.uv_low_cut_edges >= 0 || r.uv_low_split_vertices >= 0 || r.uv_low_split_faces >= 0) {
         AddRow(section.rows, "Low Cut Edges/Split V/Split F",
                std::to_string(r.uv_low_cut_edges) + " / " + std::to_string(r.uv_low_split_vertices) + " / " +
@@ -338,12 +360,17 @@ Section BuildSeamSection(const FaithCJobResult &r) {
     if (!r.uv_halfedge_island_error.empty()) {
         AddRow(section.rows, "Halfedge Seam Error", r.uv_halfedge_island_error, true);
     }
+    if (!r.uv_island_validation_error.empty()) {
+        AddRow(section.rows, "Island Validation Error", r.uv_island_validation_error, true);
+    }
     return section;
 }
 
 bool HasSeamDiagnostics(const FaithCJobResult &r) {
     return r.uv_high_island_count >= 0 || r.uv_island_conflict_faces >= 0 || r.uv_island_unknown_faces >= 0 ||
+           r.uv_semantic_component_merge_merged_components >= 0 || r.uv_semantic_final_severe_label_count >= 0 ||
            r.uv_low_cut_edges >= 0 || r.uv_cross_seam_faces >= 0 || !r.uv_halfedge_island_error.empty() ||
+           !r.uv_island_validation_mode.empty() || !r.uv_island_validation_error.empty() ||
            r.uv_island_guard_requested || r.uv_island_guard_enabled || !r.uv_island_guard_mode_used.empty() ||
            !r.uv_island_guard_error.empty();
 }
@@ -359,6 +386,9 @@ std::string BuildFaithCJobSummary(const FaithCJobResult &result) {
     }
     if (!result.uv_seam_strategy_used.empty()) {
         oss << " | seam=" << result.uv_seam_strategy_used;
+    }
+    if (!result.uv_island_validation_mode.empty()) {
+        oss << " | island_val=" << result.uv_island_validation_mode << ":" << (result.uv_island_validation_ok ? "ok" : "fail");
     }
     if (result.uv_island_conflict_faces >= 0 || result.uv_island_unknown_faces >= 0) {
         oss << " | conflict/unknown=" << result.uv_island_conflict_faces << "/" << result.uv_island_unknown_faces;

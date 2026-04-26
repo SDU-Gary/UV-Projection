@@ -116,6 +116,62 @@ def _resolve_opt_device(requested: str, default_device: str) -> str:
     return "cpu"
 
 
+def _validate_method4_state(state: Method2InternalState) -> None:
+    solve_mesh = state.solve_mesh
+    faces_np = np.asarray(solve_mesh.faces, dtype=np.int64)
+    n_faces = int(len(faces_np))
+    n_vertices = int(len(solve_mesh.vertices))
+
+    mapped_uv_init = np.asarray(state.mapped_uv_init)
+    if mapped_uv_init.shape != (n_vertices, 2):
+        raise RuntimeError(
+            f"method4 invalid mapped_uv_init shape: expected {(n_vertices, 2)}, got {mapped_uv_init.shape}"
+        )
+
+    face_pinv = np.asarray(state.face_geom_pinv)
+    if face_pinv.shape != (n_faces, 2, 3):
+        raise RuntimeError(
+            f"method4 invalid face_geom_pinv shape: expected {(n_faces, 2, 3)}, got {face_pinv.shape}"
+        )
+
+    face_target_jacobian = np.asarray(state.face_target_jacobian)
+    if face_target_jacobian.shape != (n_faces, 2, 3):
+        raise RuntimeError(
+            f"method4 invalid face_target_jacobian shape: expected {(n_faces, 2, 3)}, got {face_target_jacobian.shape}"
+        )
+
+    face_target_valid_mask = np.asarray(state.face_target_valid_mask, dtype=np.bool_).reshape(-1)
+    if face_target_valid_mask.shape[0] != n_faces:
+        raise RuntimeError(
+            f"method4 invalid face_target_valid_mask length: expected {n_faces}, got {face_target_valid_mask.shape[0]}"
+        )
+
+    face_target_weights = np.asarray(state.face_target_weights).reshape(-1)
+    if face_target_weights.shape[0] != n_faces:
+        raise RuntimeError(
+            f"method4 invalid face_target_weights length: expected {n_faces}, got {face_target_weights.shape[0]}"
+        )
+    if np.any(face_target_valid_mask & ~np.isfinite(face_target_weights)):
+        raise RuntimeError("method4 got non-finite face_target_weights on valid faces")
+    if np.any(face_target_valid_mask & (face_target_weights < 0.0)):
+        raise RuntimeError("method4 got negative face_target_weights on valid faces")
+
+    if np.any(face_target_valid_mask & ~np.isfinite(face_target_jacobian).all(axis=(1, 2))):
+        raise RuntimeError("method4 got non-finite face_target_jacobian on valid faces")
+
+    anchor_ids_np = np.asarray(state.anchor_vertex_ids, dtype=np.int64).reshape(-1)
+    anchor_uv_np = np.asarray(state.anchor_uv)
+    if anchor_ids_np.size > 0:
+        if anchor_uv_np.shape != (anchor_ids_np.size, 2):
+            raise RuntimeError(
+                f"method4 invalid anchor_uv shape: expected {(anchor_ids_np.size, 2)}, got {anchor_uv_np.shape}"
+            )
+        if np.any((anchor_ids_np < 0) | (anchor_ids_np >= n_vertices)):
+            raise RuntimeError("method4 got out-of-range anchor vertex ids")
+        if not np.isfinite(anchor_uv_np).all():
+            raise RuntimeError("method4 got non-finite anchor_uv values")
+
+
 def _run_nonlinear_refine(
     *,
     state: Method2InternalState,
@@ -142,6 +198,8 @@ def _run_nonlinear_refine(
     max_line_search_fail = max(1, int(m4_cfg.get("max_line_search_fail", 16)))
     line_alpha = float(m4_cfg.get("line_search_alpha", 0.5))
     line_c1 = float(m4_cfg.get("line_search_c1", 1e-4))
+    recovery_mode_enabled = bool(m4_cfg.get("recovery_mode_enabled", False))
+    recovery_det_improve_eps = max(0.0, float(m4_cfg.get("recovery_det_improve_eps", 1e-8)))
     patch_rounds = max(0, int(m4_cfg.get("patch_refine_rounds", 3)))
     patch_steps = max(1, int(m4_cfg.get("patch_refine_steps", 80)))
     patch_lr = float(m4_cfg.get("patch_refine_lr", 0.05))
@@ -196,8 +254,23 @@ def _run_nonlinear_refine(
         else torch.zeros((0, 2), dtype=torch.long, device=dev)
     )
     pinv_t = torch.tensor(np.asarray(state.face_geom_pinv, dtype=np.float32), dtype=torch.float32, device=dev)
-    jac_t = torch.tensor(np.asarray(state.face_target_jacobian, dtype=np.float32), dtype=torch.float32, device=dev)
-    face_w_np = np.asarray(state.face_target_weights, dtype=np.float32)
+    # Invalid faces may carry NaN placeholders from upstream projectors; zero them here so
+    # Method4 can rely on face_valid_t/face_w_t masking without 0 * NaN poisoning the data term.
+    jac_t_np = np.nan_to_num(
+        np.asarray(state.face_target_jacobian, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    jac_t = torch.tensor(jac_t_np, dtype=torch.float32, device=dev)
+    face_w_np = np.nan_to_num(
+        np.asarray(state.face_target_weights, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    face_w_np = np.maximum(face_w_np, 0.0)
+    face_w_np[~valid_face] = 0.0
     if np.any(valid_face):
         mean_w = float(np.mean(face_w_np[valid_face]))
         if mean_w > 0:
@@ -307,9 +380,38 @@ def _run_nonlinear_refine(
     best_uv = uv_var.detach().clone()
     stop_reason = "max_iters"
     line_search_fail_count = 0
+    line_search_backtrack_count = 0
+    accepted_step_count = 0
+    recovery_accepted_step_count = 0
     iters_done = 0
     patience_count = 0
     prev_energy: Optional[float] = None
+
+    def accept_candidate(
+        *,
+        prev_energy_cur: float,
+        prev_det: np.ndarray,
+        cand_energy: float,
+        cand_det: np.ndarray,
+    ) -> Tuple[bool, str]:
+        if not np.isfinite(cand_energy):
+            return False, "nonfinite_energy"
+        energy_ok = cand_energy <= prev_energy_cur * (1.0 + line_c1)
+        cand_det_min = float(np.min(cand_det)) if cand_det.size > 0 else float("inf")
+        if energy_ok and cand_det_min > det_eps * 0.1:
+            return True, "strict"
+
+        prev_viol = int(np.count_nonzero(prev_det <= det_eps))
+        if not recovery_mode_enabled or prev_viol <= 0 or not energy_ok:
+            return False, "strict_reject"
+
+        cand_viol = int(np.count_nonzero(cand_det <= det_eps))
+        prev_det_min = float(np.min(prev_det)) if prev_det.size > 0 else float("inf")
+        if cand_viol < prev_viol:
+            return True, "recovery_lower_violation_count"
+        if cand_viol == prev_viol and cand_det_min > prev_det_min + recovery_det_improve_eps:
+            return True, "recovery_same_violation_better_det"
+        return False, "recovery_reject"
 
     for step in range(1, max_iters + 1):
         if homotopy_enabled:
@@ -344,29 +446,42 @@ def _run_nonlinear_refine(
 
         iters_done = step
         _, cur_energy, cur_det = eval_no_grad(uv_var, logdet_scale=logdet_scale)
-        cur_det_min = float(np.min(cur_det)) if cur_det.size > 0 else float("inf")
-
-        needs_backtrack = (not np.isfinite(cur_energy)) or (cur_energy > prev_energy_cur * (1.0 + line_c1)) or (
-            cur_det_min <= det_eps * 0.1
+        accepted_step, accept_mode = accept_candidate(
+            prev_energy_cur=prev_energy_cur,
+            prev_det=prev_det,
+            cand_energy=cur_energy,
+            cand_det=cur_det,
         )
+        needs_backtrack = not accepted_step
         if needs_backtrack:
-            line_search_fail_count += 1
+            line_search_backtrack_count += 1
             accepted = False
+            accepted_mode = "none"
             direction = uv_var.detach() - prev_uv
             t = line_alpha
             while t > 1e-4:
                 candidate = prev_uv + t * direction
                 _, cand_energy, cand_det = eval_no_grad(candidate, logdet_scale=logdet_scale)
-                cand_det_min = float(np.min(cand_det)) if cand_det.size > 0 else float("inf")
-                if np.isfinite(cand_energy) and cand_energy <= prev_energy_cur and cand_det_min > det_eps * 0.1:
+                cand_accept, cand_mode = accept_candidate(
+                    prev_energy_cur=prev_energy_cur,
+                    prev_det=prev_det,
+                    cand_energy=cand_energy,
+                    cand_det=cand_det,
+                )
+                if cand_accept:
                     with torch.no_grad():
                         uv_var.copy_(candidate)
                     cur_energy = cand_energy
                     cur_det = cand_det
                     accepted = True
+                    accepted_step = True
+                    accept_mode = cand_mode
+                    accepted_mode = cand_mode
                     break
                 t *= line_alpha
             if not accepted:
+                line_search_fail_count += 1
+                accepted_step = False
                 with torch.no_grad():
                     uv_var.copy_(prev_uv)
                 cur_energy = prev_energy_cur
@@ -374,6 +489,13 @@ def _run_nonlinear_refine(
             if line_search_fail_count >= max_line_search_fail:
                 stop_reason = "line_search_fail_limit"
                 break
+        else:
+            accepted_mode = accept_mode
+
+        if accepted_step:
+            accepted_step_count += 1
+            if str(accepted_mode).startswith("recovery_"):
+                recovery_accepted_step_count += 1
 
         if cur_energy < best_energy:
             best_energy = cur_energy
@@ -442,12 +564,14 @@ def _run_nonlinear_refine(
     final_legacy = float(best_terms[6].detach().cpu().item())
     final_anchor = float(best_terms[7].detach().cpu().item())
 
+    refine_status = "ok" if accepted_step_count > 0 else "stalled_no_accepted_step"
     meta = {
         "uv_m4_enabled": True,
-        "uv_m4_refine_status": "ok",
+        "uv_m4_refine_status": refine_status,
         "uv_m4_device": str(dev),
         "uv_m4_optimizer": optimizer_name,
         "uv_m4_nonlinear_iters": int(iters_done),
+        "uv_m4_accepted_step_count": int(accepted_step_count),
         "uv_m4_energy_init": float(init_energy),
         "uv_m4_energy_final": float(final_total),
         "uv_m4_energy_data_init": float(init_terms[1].detach().cpu().item()),
@@ -462,6 +586,10 @@ def _run_nonlinear_refine(
         "uv_m4_barrier_homotopy_enabled": bool(homotopy_enabled),
         "uv_m4_barrier_homotopy_warmup_iters": int(homotopy_warmup),
         "uv_m4_line_search_fail_count": int(line_search_fail_count),
+        "uv_m4_line_search_backtrack_count": int(line_search_backtrack_count),
+        "uv_m4_recovery_mode_enabled": bool(recovery_mode_enabled),
+        "uv_m4_recovery_det_improve_eps": float(recovery_det_improve_eps),
+        "uv_m4_recovery_accepted_step_count": int(recovery_accepted_step_count),
         "uv_m4_patch_refine_rounds": int(patch_rounds_used),
         "uv_m4_det_min": float(best_det_min),
         "uv_m4_det_p01": float(best_det_p01),
@@ -469,6 +597,79 @@ def _run_nonlinear_refine(
         **pre_repair_meta,
     }
     return uv_out, meta
+
+
+def run_method4_from_internal_state(
+    *,
+    internal: Method2InternalState,
+    base_stats: Dict[str, Any],
+    export_payload: Dict[str, Any],
+    image,
+    cfg: Dict[str, Any],
+    success_solver_stage: str = "m4",
+    fallback_solver_stage: str = "m2_fallback_after_m4",
+    disabled_solver_stage: str = "m2",
+) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+    m4_cfg = cfg.get("method4", {})
+    if not bool(m4_cfg.get("enabled", True)):
+        out_stats = dict(base_stats)
+        out_stats.update(
+            {
+                "uv_solver_stage": disabled_solver_stage,
+                "uv_m4_enabled": False,
+                "uv_m4_refine_status": "disabled_by_config",
+                "uv_m4_nonlinear_iters": 0,
+                "uv_m4_energy_init": None,
+                "uv_m4_energy_final": None,
+                "uv_m4_barrier_violations": None,
+                "uv_m4_line_search_fail_count": 0,
+                "uv_m4_line_search_backtrack_count": 0,
+                "uv_m4_patch_refine_rounds": 0,
+                "uv_m4_det_min": None,
+                "uv_m4_det_p01": None,
+            }
+        )
+        return internal.mapped_uv_init.copy(), out_stats, export_payload
+
+    _validate_method4_state(internal)
+
+    mapped_uv_m4, m4_meta = _run_nonlinear_refine(state=internal, cfg=cfg)
+    fallback_on_violation = bool(m4_cfg.get("fallback_to_method2_on_violation", True))
+    barrier_viol = int(m4_meta.get("uv_m4_barrier_violations", 0))
+    valid_faces = int(np.count_nonzero(np.asarray(internal.face_target_valid_mask, dtype=np.bool_)))
+    violation_ratio = float(barrier_viol / max(1, valid_faces))
+    viol_ratio_tol = max(0.0, float(m4_cfg.get("fallback_violation_ratio_tol", 0.02)))
+    viol_count_tol = max(0, int(m4_cfg.get("fallback_violation_count_tol", 8)))
+    m4_meta["uv_m4_barrier_violation_ratio"] = violation_ratio
+    m4_meta["uv_m4_barrier_violation_ratio_tol"] = float(viol_ratio_tol)
+    m4_meta["uv_m4_barrier_violation_count_tol"] = int(viol_count_tol)
+
+    fallback_triggered = barrier_viol > viol_count_tol and violation_ratio > viol_ratio_tol
+    if fallback_triggered and fallback_on_violation:
+        out_stats = dict(base_stats)
+        out_stats.update(m4_meta)
+        out_stats["uv_solver_stage"] = fallback_solver_stage
+        out_stats["uv_m4_refine_status"] = "fallback_to_m2_injective_failed"
+        return internal.mapped_uv_init.copy(), out_stats, export_payload
+
+    solve_mesh = internal.solve_mesh
+    if internal.solve_sample_face_ids.size > 0:
+        pred_uv = interpolate_sample_uv(
+            np.asarray(solve_mesh.faces, dtype=np.int64),
+            internal.solve_sample_face_ids,
+            internal.solve_sample_bary,
+            mapped_uv_m4,
+        )
+        color_l1, color_l2 = texture_reprojection_error(image, internal.solve_target_uv, pred_uv)
+    else:
+        color_l1, color_l2 = None, None
+
+    out_stats = dict(base_stats)
+    out_stats["uv_solver_stage"] = success_solver_stage
+    out_stats["uv_color_reproj_l1"] = color_l1
+    out_stats["uv_color_reproj_l2"] = color_l2
+    out_stats.update(m4_meta)
+    return mapped_uv_m4, out_stats, export_payload
 
 
 def run_method4_jacobian_injective(
@@ -498,26 +699,6 @@ def run_method4_jacobian_injective(
     )
     mapped_uv_m2, method2_stats, export_payload, internal = m2_out
 
-    m4_cfg = cfg.get("method4", {})
-    if not bool(m4_cfg.get("enabled", True)):
-        out_stats = dict(method2_stats)
-        out_stats.update(
-            {
-                "uv_solver_stage": "m2",
-                "uv_m4_enabled": False,
-                "uv_m4_refine_status": "disabled_by_config",
-                "uv_m4_nonlinear_iters": 0,
-                "uv_m4_energy_init": None,
-                "uv_m4_energy_final": None,
-                "uv_m4_barrier_violations": None,
-                "uv_m4_line_search_fail_count": 0,
-                "uv_m4_patch_refine_rounds": 0,
-                "uv_m4_det_min": None,
-                "uv_m4_det_p01": None,
-            }
-        )
-        return mapped_uv_m2, out_stats, export_payload
-
     if internal is None:
         out_stats = dict(method2_stats)
         out_stats.update(
@@ -530,6 +711,7 @@ def run_method4_jacobian_injective(
                 "uv_m4_energy_final": None,
                 "uv_m4_barrier_violations": None,
                 "uv_m4_line_search_fail_count": 0,
+                "uv_m4_line_search_backtrack_count": 0,
                 "uv_m4_patch_refine_rounds": 0,
                 "uv_m4_det_min": None,
                 "uv_m4_det_p01": None,
@@ -537,43 +719,16 @@ def run_method4_jacobian_injective(
         )
         return mapped_uv_m2, out_stats, export_payload
 
-    mapped_uv_m4, m4_meta = _run_nonlinear_refine(state=internal, cfg=cfg)
-    fallback_on_violation = bool(m4_cfg.get("fallback_to_method2_on_violation", True))
-    barrier_viol = int(m4_meta.get("uv_m4_barrier_violations", 0))
-    valid_faces = int(np.count_nonzero(np.asarray(internal.face_target_valid_mask, dtype=np.bool_)))
-    violation_ratio = float(barrier_viol / max(1, valid_faces))
-    viol_ratio_tol = max(0.0, float(m4_cfg.get("fallback_violation_ratio_tol", 0.02)))
-    viol_count_tol = max(0, int(m4_cfg.get("fallback_violation_count_tol", 8)))
-    m4_meta["uv_m4_barrier_violation_ratio"] = violation_ratio
-    m4_meta["uv_m4_barrier_violation_ratio_tol"] = float(viol_ratio_tol)
-    m4_meta["uv_m4_barrier_violation_count_tol"] = int(viol_count_tol)
-
-    fallback_triggered = barrier_viol > viol_count_tol and violation_ratio > viol_ratio_tol
-    if fallback_triggered and fallback_on_violation:
-        out_stats = dict(method2_stats)
-        out_stats.update(m4_meta)
-        out_stats["uv_solver_stage"] = "m2_fallback_after_m4"
-        out_stats["uv_m4_refine_status"] = "fallback_to_m2_injective_failed"
-        return mapped_uv_m2, out_stats, export_payload
-
-    solve_mesh = internal.solve_mesh
-    if internal.solve_sample_face_ids.size > 0:
-        pred_uv = interpolate_sample_uv(
-            np.asarray(solve_mesh.faces, dtype=np.int64),
-            internal.solve_sample_face_ids,
-            internal.solve_sample_bary,
-            mapped_uv_m4,
-        )
-        color_l1, color_l2 = texture_reprojection_error(image, internal.solve_target_uv, pred_uv)
-    else:
-        color_l1, color_l2 = None, None
-
-    out_stats = dict(method2_stats)
-    out_stats["uv_solver_stage"] = "m4"
-    out_stats["uv_color_reproj_l1"] = color_l1
-    out_stats["uv_color_reproj_l2"] = color_l2
-    out_stats.update(m4_meta)
-    return mapped_uv_m4, out_stats, export_payload
+    return run_method4_from_internal_state(
+        internal=internal,
+        base_stats=method2_stats,
+        export_payload=export_payload,
+        image=image,
+        cfg=cfg,
+        success_solver_stage="m4",
+        fallback_solver_stage="m2_fallback_after_m4",
+        disabled_solver_stage="m2",
+    )
 
 
-__all__ = ["run_method4_jacobian_injective"]
+__all__ = ["run_method4_from_internal_state", "run_method4_jacobian_injective"]

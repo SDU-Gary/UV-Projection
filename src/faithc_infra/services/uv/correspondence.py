@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import trimesh
 
+from ..atom3d_runtime import ensure_atom3d_cuda_runtime
+
 
 def build_high_cuda_context(
     *,
@@ -12,6 +14,10 @@ def build_high_cuda_context(
     high_uv: np.ndarray,
     device: str,
 ) -> Dict[str, Any]:
+    runtime_diag: Dict[str, Any] = {}
+    if str(device).strip().lower() == "cuda":
+        runtime_diag = ensure_atom3d_cuda_runtime(device, strict=True, require_cuda=True)
+
     import torch
     from atom3d import MeshBVH
 
@@ -38,6 +44,7 @@ def build_high_cuda_context(
         "face_normals_t": face_normals_t,
         "bvh": bvh,
         "bbox_diag": bbox_diag,
+        "runtime_diag": runtime_diag,
     }
 
 
@@ -473,7 +480,11 @@ def bvh_project_points(
     chunk_size: int,
     return_dist: bool = False,
     return_face_normals: bool = False,
-) -> Dict[str, np.ndarray]:
+) -> Dict[str, Any]:
+    runtime_diag: Dict[str, Any] = {}
+    if str(device).strip().lower() == "cuda":
+        runtime_diag = ensure_atom3d_cuda_runtime(device, strict=True, require_cuda=True)
+
     import torch
     from atom3d import MeshBVH
 
@@ -517,9 +528,10 @@ def bvh_project_points(
     mapped_uv = np.concatenate(mapped_list, axis=0).astype(np.float32)
     face_ids_np = np.concatenate(face_ids_list, axis=0).astype(np.int64)
 
-    out: Dict[str, np.ndarray] = {
+    out: Dict[str, Any] = {
         "mapped_uv": mapped_uv,
         "face_ids": face_ids_np,
+        "runtime_diag": runtime_diag,
     }
     if return_dist:
         out["distance"] = np.concatenate(dist_list, axis=0).astype(np.float32)

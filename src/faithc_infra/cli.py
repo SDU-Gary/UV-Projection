@@ -184,6 +184,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                             retry_resolutions=recon_cfg.get("retry_resolutions"),
                             min_level=int(recon_cfg.get("min_level", -1)),
                             solver_weights=recon_cfg.get("solver_weights"),
+                            backend=str(recon_cfg.get("backend", "faithc")),
+                            decimation_options=recon_cfg.get("pymeshlab"),
                         )
                     paths["high_mesh_normalized"] = str(rec.high_mesh_normalized_path)
                     paths["low_mesh"] = str(rec.low_mesh_path)

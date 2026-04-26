@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import deque
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -17,11 +18,10 @@ import sys
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from faithc_infra.services.halfedge_topology import compute_high_face_uv_islands
 from faithc_infra.services.uv.correspondence import build_high_cuda_context
-from faithc_infra.services.uv.mesh_sanitizer import sanitize_mesh_for_halfedge
+from faithc_infra.services.uv.island_pipeline import run_halfedge_island_pipeline
 from faithc_infra.services.uv.options import DEFAULT_OPTIONS, deep_merge_dict
-from faithc_infra.services.uv.semantic_transfer import transfer_face_semantics_by_projection
+from faithc_infra.services.atom3d_runtime import ensure_atom3d_cuda_runtime
 
 
 def _load_mesh(path: Path) -> trimesh.Trimesh:
@@ -61,6 +61,28 @@ def _face_neighbors(mesh: trimesh.Trimesh) -> List[List[int]]:
             neigh[ia].append(ib)
             neigh[ib].append(ia)
     return neigh
+
+
+def _face_component_sizes_from_neighbors(neighbors: List[List[int]]) -> np.ndarray:
+    n_faces = int(len(neighbors))
+    comp_sizes = np.zeros((n_faces,), dtype=np.int32)
+    seen = np.zeros((n_faces,), dtype=np.bool_)
+    for fid in range(n_faces):
+        if seen[fid]:
+            continue
+        q: deque[int] = deque([int(fid)])
+        seen[fid] = True
+        comp_faces: List[int] = []
+        while q:
+            cur = q.popleft()
+            comp_faces.append(cur)
+            for nb in neighbors[cur]:
+                if not seen[nb]:
+                    seen[nb] = True
+                    q.append(int(nb))
+        csz = int(len(comp_faces))
+        comp_sizes[np.asarray(comp_faces, dtype=np.int64)] = int(csz)
+    return comp_sizes
 
 
 def _component_sizes_for_label(
@@ -181,6 +203,99 @@ def _audit_semantic_connectivity(
     return summary, per_label
 
 
+def _cross_semantic_edge_stats(
+    *,
+    mesh: trimesh.Trimesh,
+    labels: np.ndarray,
+) -> Dict[str, Any]:
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    face_labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if faces.shape[0] != face_labels.shape[0]:
+        raise RuntimeError("cross-semantic audit: labels/face mismatch")
+
+    edge_faces: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for fid, tri in enumerate(faces.tolist()):
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        edge_faces[(min(a, b), max(a, b))].append(int(fid))
+        edge_faces[(min(b, c), max(b, c))].append(int(fid))
+        edge_faces[(min(c, a), max(c, a))].append(int(fid))
+
+    boundary_edges = 0
+    nonmanifold_edges = 0
+    interior_edges_total = 0
+    interior_known_edges = 0
+    interior_unknown_touch_edges = 0
+    cross_semantic_edges = 0
+    same_semantic_edges = 0
+
+    for _, flist in edge_faces.items():
+        if len(flist) == 1:
+            boundary_edges += 1
+            continue
+        if len(flist) != 2:
+            nonmanifold_edges += 1
+            continue
+        interior_edges_total += 1
+        f0, f1 = int(flist[0]), int(flist[1])
+        l0 = int(face_labels[f0])
+        l1 = int(face_labels[f1])
+        if l0 < 0 or l1 < 0:
+            interior_unknown_touch_edges += 1
+            continue
+        interior_known_edges += 1
+        if l0 != l1:
+            cross_semantic_edges += 1
+        else:
+            same_semantic_edges += 1
+
+    return {
+        "low_edge_boundary_count": int(boundary_edges),
+        "low_edge_nonmanifold_count": int(nonmanifold_edges),
+        "low_edge_interior_total": int(interior_edges_total),
+        "low_edge_interior_known": int(interior_known_edges),
+        "low_edge_interior_unknown_touch": int(interior_unknown_touch_edges),
+        "low_edge_cross_semantic_count": int(cross_semantic_edges),
+        "low_edge_same_semantic_count": int(same_semantic_edges),
+        "low_edge_cross_semantic_ratio_in_known": float(cross_semantic_edges / max(1, interior_known_edges)),
+    }
+
+
+def _classify_cross_semantic_pattern(
+    *,
+    cross_semantic_count: int,
+    high_seam_edges: int,
+    summary: Dict[str, Any],
+    pepper_ratio_threshold: float,
+    reasonable_low: float,
+    reasonable_high: float,
+) -> Dict[str, Any]:
+    ratio = float(cross_semantic_count / max(1, int(high_seam_edges)))
+    pepper = bool(ratio >= float(pepper_ratio_threshold))
+    fragmented = int(summary.get("fragmented_label_count", 0))
+    severe = int(summary.get("severe_label_count", 0))
+    normal = bool(summary.get("normal_overall", False))
+    reasonable = bool(float(reasonable_low) <= ratio <= float(reasonable_high))
+
+    if pepper:
+        mode = "pepper_noise_likely"
+        reason = "low cross-semantic edges are far higher than high UV seam edges"
+    elif (not normal) and reasonable and (fragmented > 0 or severe > 0):
+        mode = "coarse_semantic_shift_likely"
+        reason = "cross-semantic edge count is in a reasonable range but islands are fragmented/misaligned"
+    elif not normal:
+        mode = "fragmented_but_inconclusive"
+        reason = "islands are fragmented but cross-semantic edge ratio is not clearly diagnostic"
+    else:
+        mode = "healthy_or_near_healthy"
+        reason = "semantic connectivity is mostly coherent"
+
+    return {
+        "cross_semantic_vs_high_seam_ratio": float(ratio),
+        "diagnosis_mode": mode,
+        "diagnosis_reason": reason,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Audit semantic connectivity per low-face semantic ID (without seam cutting)"
@@ -205,6 +320,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tiny-abs-threshold", type=int, default=16)
     p.add_argument("--tiny-ratio-threshold", type=float, default=0.005)
     p.add_argument("--tiny-max-components", type=int, default=2)
+    p.add_argument(
+        "--pepper-ratio-threshold",
+        type=float,
+        default=2.0,
+        help="If low cross-semantic edge count / high seam edge count exceeds this, flag pepper-noise likely",
+    )
+    p.add_argument(
+        "--reasonable-cross-ratio-low",
+        type=float,
+        default=0.5,
+        help="Lower bound of a reasonable cross/high ratio window",
+    )
+    p.add_argument(
+        "--reasonable-cross-ratio-high",
+        type=float,
+        default=2.0,
+        help="Upper bound of a reasonable cross/high ratio window",
+    )
+    p.add_argument(
+        "--ignore-small-mesh-components-faces",
+        type=int,
+        default=32,
+        help="Ignore faces on low-mesh connected components smaller than this when auditing semantic connectivity",
+    )
+    p.add_argument(
+        "--component-merge-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable small-component semantic absorption before seam extraction",
+    )
+    p.add_argument(
+        "--component-merge-min-faces",
+        type=int,
+        default=4,
+        help="Merge semantic connected components smaller than this face count",
+    )
+    p.add_argument(
+        "--component-merge-max-iters",
+        type=int,
+        default=8,
+        help="Maximum cleanup iterations for small semantic components",
+    )
     return p.parse_args()
 
 
@@ -216,128 +373,8 @@ def _resolve_device(name: str) -> str:
     return "cuda" if bool(torch.cuda.is_available()) else "cpu"
 
 
-def _patch_atom3d_kernels_for_current_gpu() -> Dict[str, Any]:
-    import torch
-    from torch.utils.cpp_extension import load
-
-    import atom3d
-    from atom3d.core import mesh_bvh as mesh_bvh_mod
-    from atom3d.kernels import bvh as bvh_kernels_mod
-    import atom3d.kernels as kernels_mod
-
-    major, minor = torch.cuda.get_device_capability(0)
-    arch = f"{major}{minor}"
-
-    atom3d_root = Path(atom3d.__file__).resolve().parent
-    kernels_root = atom3d_root / "kernels"
-    cumtv_src = kernels_root / "cumtv_kernels.cu"
-    bvh_src = kernels_root / "bvh_kernels.cu"
-    if not cumtv_src.exists() or not bvh_src.exists():
-        raise RuntimeError(
-            "Atom3d CUDA source files are missing. Expected files:\n"
-            f"- {cumtv_src}\n"
-            f"- {bvh_src}"
-        )
-
-    gencode = f"-gencode=arch=compute_{arch},code=sm_{arch}"
-    gencode_ptx = f"-gencode=arch=compute_{arch},code=compute_{arch}"
-
-    cumtv_build = kernels_root / "build"
-    bvh_build = kernels_root / "build" / "bvh"
-    cumtv_build.mkdir(parents=True, exist_ok=True)
-    bvh_build.mkdir(parents=True, exist_ok=True)
-
-    cumtv_name = f"cumtv_cuda_sm{arch}"
-    bvh_name = f"bvh_cuda_sm{arch}"
-
-    cumtv_cuda = load(
-        name=cumtv_name,
-        sources=[str(cumtv_src)],
-        build_directory=str(cumtv_build),
-        extra_cuda_cflags=["-O3", "--use_fast_math", gencode, gencode_ptx],
-        verbose=False,
-    )
-    bvh_cuda = load(
-        name=bvh_name,
-        sources=[str(bvh_src)],
-        build_directory=str(bvh_build),
-        extra_cuda_cflags=["-O3", gencode, gencode_ptx],
-        verbose=False,
-    )
-
-    kernels_mod._cumtv_cuda = cumtv_cuda
-    kernels_mod._kernel_loaded = True
-    kernels_mod.get_cuda_kernels = lambda: cumtv_cuda
-
-    bvh_kernels_mod._bvh_cuda = bvh_cuda
-    bvh_kernels_mod.get_bvh_kernels = lambda: bvh_cuda
-
-    mesh_bvh_mod.HAS_CUDA = True
-    mesh_bvh_mod.HAS_BVH = True
-    mesh_bvh_mod.BVHAccelerator = bvh_kernels_mod.BVHAccelerator
-
-    return {
-        "gpu_compute_capability": f"{major}.{minor}",
-        "atom3d_arch": arch,
-        "atom3d_cumtv_module": cumtv_name,
-        "atom3d_bvh_module": bvh_name,
-    }
-
-
-def _smoke_test_atom3d_kernels() -> None:
-    import torch
-    import atom3d.kernels as kernels_mod
-
-    vertices = torch.tensor(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        dtype=torch.float32,
-        device="cuda",
-    )
-    faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device="cuda")
-    aabb_min = torch.tensor([[0.0, 0.0, -0.1]], dtype=torch.float32, device="cuda")
-    aabb_max = torch.tensor([[1.0, 1.0, 0.1]], dtype=torch.float32, device="cuda")
-
-    hit_mask, _, _ = kernels_mod.triangle_aabb_intersect(vertices, faces, aabb_min, aabb_max)
-    if hit_mask.numel() == 0 or not bool(hit_mask[0].item()):
-        raise RuntimeError(
-            "Atom3d kernel smoke test failed: triangle_aabb_intersect expected a hit but got miss."
-        )
-
-
 def _ensure_atom3d_runtime_for_device(device: str) -> Dict[str, Any]:
-    if str(device) != "cuda":
-        return {"atom3d_runtime_patched": False, "reason": "device_not_cuda"}
-    import torch
-
-    if not torch.cuda.is_available():
-        return {
-            "atom3d_runtime_patched": False,
-            "reason": "torch_cuda_unavailable",
-        }
-
-    import atom3d
-
-    atom3d_root = Path(atom3d.__file__).resolve().parent
-    kernel_file = atom3d_root / "kernels" / "cumtv_kernels.cu"
-    if not kernel_file.exists():
-        return {
-            "atom3d_runtime_patched": False,
-            "reason": f"missing_kernel_source:{kernel_file}",
-        }
-
-    try:
-        diag = _patch_atom3d_kernels_for_current_gpu()
-        _smoke_test_atom3d_kernels()
-    except Exception as exc:
-        return {
-            "atom3d_runtime_patched": False,
-            "reason": f"runtime_patch_failed:{exc}",
-        }
-
-    out: Dict[str, Any] = dict(diag)
-    out["atom3d_runtime_patched"] = True
-    out["atom3d_smoke_test"] = "passed"
-    return out
+    return ensure_atom3d_cuda_runtime(device, strict=False)
 
 
 def main() -> None:
@@ -349,24 +386,15 @@ def main() -> None:
     opts = deep_merge_dict(DEFAULT_OPTIONS, {})
     seam_cfg = dict(opts.get("seam", {}))
     corr_cfg = dict(opts.get("correspondence", {}))
-
-    sanitize_meta: Dict[str, Any] = {}
-    if bool(args.sanitize_low):
-        low_mesh, sanitize_meta = sanitize_mesh_for_halfedge(low_mesh=low_mesh_in, seam_cfg=seam_cfg)
-    else:
-        low_mesh = trimesh.Trimesh(
-            vertices=np.asarray(low_mesh_in.vertices, dtype=np.float32),
-            faces=np.asarray(low_mesh_in.faces, dtype=np.int64),
-            process=False,
-        )
-
-    high_face_island, high_meta = compute_high_face_uv_islands(
-        vertices=np.asarray(high_mesh.vertices, dtype=np.float64),
-        faces=np.asarray(high_mesh.faces, dtype=np.int64),
-        uv=np.asarray(high_uv, dtype=np.float64),
-        position_eps=float(seam_cfg.get("high_position_eps", 1e-6)),
-        uv_eps=float(seam_cfg.get("high_uv_eps", 1e-5)),
-    )
+    seam_cfg["strategy"] = "halfedge_island"
+    seam_cfg["sanitize_enabled"] = bool(args.sanitize_low)
+    seam_cfg["validation_mode"] = "diagnostic"
+    seam_cfg["transfer_sampling_mode"] = "four_point_bfs"
+    if "transfer_max_dist_ratio" not in seam_cfg:
+        seam_cfg["transfer_max_dist_ratio"] = 0.005
+    seam_cfg["component_merge_enabled"] = bool(args.component_merge_enabled)
+    seam_cfg["component_merge_min_faces"] = int(args.component_merge_min_faces)
+    seam_cfg["component_merge_max_iters"] = int(args.component_merge_max_iters)
 
     resolved_device = _resolve_device(str(args.device))
     runtime_diag = _ensure_atom3d_runtime_for_device(resolved_device)
@@ -375,22 +403,91 @@ def main() -> None:
         high_uv=high_uv,
         device=resolved_device,
     )
-    semantic = transfer_face_semantics_by_projection(
+    island_result = run_halfedge_island_pipeline(
+        high_mesh=high_mesh,
+        high_uv=np.asarray(high_uv, dtype=np.float64),
+        low_mesh=low_mesh_in,
         high_ctx=high_ctx,
-        high_face_island=np.asarray(high_face_island, dtype=np.int64),
-        low_mesh=low_mesh,
         seam_cfg=seam_cfg,
         corr_cfg=corr_cfg,
     )
-    low_labels = np.asarray(semantic["low_face_island"], dtype=np.int64).reshape(-1)
+    low_mesh = island_result.low_mesh
+    sanitize_meta = {k: v for k, v in island_result.meta.items() if str(k).startswith("uv_sanitize_")}
+    high_meta = dict(island_result.high.meta) if island_result.high is not None else {}
+    semantic_meta = dict(island_result.semantic.meta) if island_result.semantic is not None else {}
+    if island_result.semantic is not None:
+        low_labels = np.asarray(island_result.semantic.face_labels, dtype=np.int64).reshape(-1)
+    else:
+        low_labels = np.full((len(low_mesh.faces),), -1, dtype=np.int64)
     neighbors = _face_neighbors(low_mesh)
-    summary, per_label = _audit_semantic_connectivity(
+    stage_summaries_raw: Dict[str, Any] = {}
+    stage_summaries_filtered: Dict[str, Any] = {}
+
+    def _stage_summary(stage_name: str, labels_arr: np.ndarray) -> Dict[str, Any]:
+        stage_summary, _ = _audit_semantic_connectivity(
+            labels=labels_arr,
+            neighbors=neighbors,
+            main_ratio_threshold=float(args.main_ratio_threshold),
+            tiny_abs_threshold=int(args.tiny_abs_threshold),
+            tiny_ratio_threshold=float(args.tiny_ratio_threshold),
+            tiny_max_components=int(args.tiny_max_components),
+        )
+        return stage_summary
+
+    if island_result.semantic is not None:
+        stage_inputs = {
+            "pre_bfs": np.asarray(island_result.semantic.pre_bfs_labels, dtype=np.int64).reshape(-1),
+            "pre_cleanup": np.asarray(
+                island_result.semantic.pre_cleanup_labels
+                if island_result.semantic.pre_cleanup_labels is not None
+                else island_result.semantic.face_labels,
+                dtype=np.int64,
+            ).reshape(-1),
+            "final": np.asarray(island_result.semantic.face_labels, dtype=np.int64).reshape(-1),
+        }
+        for stage_name, labels_stage in stage_inputs.items():
+            stage_summaries_raw[stage_name] = _stage_summary(stage_name, labels_stage)
+
+    summary_raw, per_label_raw = _audit_semantic_connectivity(
         labels=low_labels,
         neighbors=neighbors,
         main_ratio_threshold=float(args.main_ratio_threshold),
         tiny_abs_threshold=int(args.tiny_abs_threshold),
         tiny_ratio_threshold=float(args.tiny_ratio_threshold),
         tiny_max_components=int(args.tiny_max_components),
+    )
+    labels_for_audit = low_labels.copy()
+    ignored_small_faces = 0
+    min_comp_faces = int(max(0, args.ignore_small_mesh_components_faces))
+    if min_comp_faces > 1 and labels_for_audit.size > 0:
+        comp_sizes = _face_component_sizes_from_neighbors(neighbors)
+        keep_mask = comp_sizes >= min_comp_faces
+        ignored_small_faces = int(np.count_nonzero(~keep_mask))
+        labels_for_audit[~keep_mask] = -1
+        if island_result.semantic is not None:
+            for stage_name, labels_stage in stage_inputs.items():
+                filtered_labels = np.asarray(labels_stage, dtype=np.int64).copy()
+                filtered_labels[~keep_mask] = -1
+                stage_summaries_filtered[stage_name] = _stage_summary(stage_name, filtered_labels)
+    elif island_result.semantic is not None:
+        stage_summaries_filtered = dict(stage_summaries_raw)
+
+    summary, per_label = _audit_semantic_connectivity(
+        labels=labels_for_audit,
+        neighbors=neighbors,
+        main_ratio_threshold=float(args.main_ratio_threshold),
+        tiny_abs_threshold=int(args.tiny_abs_threshold),
+        tiny_ratio_threshold=float(args.tiny_ratio_threshold),
+        tiny_max_components=int(args.tiny_max_components),
+    )
+    cross_stats = _cross_semantic_edge_stats(mesh=low_mesh, labels=low_labels)
+    diagnosis = _classify_cross_semantic_pattern(
+        cross_semantic_count=int(cross_stats.get("low_edge_cross_semantic_count", 0)),
+        high_seam_edges=int(high_meta.get("high_seam_edges", 0)),
+        summary=summary_raw,
+        pepper_ratio_threshold=float(args.pepper_ratio_threshold),
+        reasonable_low=float(args.reasonable_cross_ratio_low),
+        reasonable_high=float(args.reasonable_cross_ratio_high),
     )
 
     report: Dict[str, Any] = {
@@ -403,8 +500,17 @@ def main() -> None:
         "sanitize_low": bool(args.sanitize_low),
         "sanitize_meta": sanitize_meta,
         "high_uv_island_meta": high_meta,
-        "semantic_transfer_meta": semantic.get("meta", {}),
+        "island_pipeline_meta": island_result.meta,
+        "semantic_transfer_meta": semantic_meta,
+        "audit_filter_min_component_faces": int(min_comp_faces),
+        "audit_filter_ignored_faces": int(ignored_small_faces),
+        "summary_raw": summary_raw,
         "summary": summary,
+        "cross_semantic_edges": cross_stats,
+        "cross_semantic_diagnosis": diagnosis,
+        "stage_summaries_raw": stage_summaries_raw,
+        "stage_summaries": stage_summaries_filtered,
+        "labels_raw": per_label_raw,
         "labels": per_label,
     }
 
@@ -414,6 +520,24 @@ def main() -> None:
         f"fragmented_labels={summary['fragmented_label_count']}, severe_labels={summary['severe_label_count']}, "
         f"intrusion_like_labels={summary['intrusion_like_label_count']}, normal_overall={summary['normal_overall']}"
     )
+    print(
+        "[semantic_connectivity][cross_edges] "
+        f"low_cross={cross_stats['low_edge_cross_semantic_count']}, "
+        f"high_seam={int(high_meta.get('high_seam_edges', 0))}, "
+        f"ratio={diagnosis['cross_semantic_vs_high_seam_ratio']:.4f}, "
+        f"mode={diagnosis['diagnosis_mode']}"
+    )
+    if stage_summaries_filtered:
+        for stage_name in ["pre_bfs", "pre_cleanup", "final"]:
+            if stage_name not in stage_summaries_filtered:
+                continue
+            ss = stage_summaries_filtered[stage_name]
+            print(
+                "[semantic_connectivity][stage] "
+                f"{stage_name}: labels={ss['label_count']}, unknown={ss['face_count_unknown']}, "
+                f"fragmented={ss['fragmented_label_count']}, severe={ss['severe_label_count']}, "
+                f"intrusion={ss['intrusion_like_label_count']}, normal={ss['normal_overall']}"
+            )
 
     top = per_label[: min(15, len(per_label))]
     for item in top:

@@ -23,6 +23,7 @@ import numpy as np
 
 # FaithContour imports
 from faithcontour import FCTEncoder, FCTDecoder
+from faithc_infra.services.atom3d_runtime import ensure_atom3d_cuda_runtime
 
 # Atom3d imports
 from atom3d import MeshBVH
@@ -195,6 +196,9 @@ def main():
     print(f"   • Bounds: [{mesh.vertices.min():.3f}, {mesh.vertices.max():.3f}]")
 
     # --- Convert to torch tensors ---
+    if str(device) == "cuda":
+        ensure_atom3d_cuda_runtime(device, strict=True, require_cuda=True)
+
     vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
     faces = torch.tensor(mesh.faces, dtype=torch.long, device=device)
 

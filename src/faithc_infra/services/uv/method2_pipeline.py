@@ -9,9 +9,7 @@ import trimesh
 from scipy.sparse import coo_matrix, csr_matrix, diags
 
 from ..halfedge_topology import (
-    compute_high_face_uv_islands,
     detect_cut_edges_from_face_labels,
-    split_vertices_along_cut_edges,
 )
 from .correspondence import (
     build_high_cuda_context,
@@ -19,9 +17,7 @@ from .correspondence import (
     detect_cross_seam_faces,
     major_face_island_labels,
 )
-from .mesh_sanitizer import ensure_halfedge_external_dependencies, sanitize_mesh_for_halfedge
-from .openmesh_seams import extract_seam_edges_openmesh, validate_face_partition_by_seams
-from .semantic_transfer import transfer_face_semantics_by_projection
+from .island_pipeline import compute_cached_high_face_uv_islands, run_halfedge_island_pipeline
 from .linear_solver import (
     build_cuda_sparse_system,
     connected_components_labels,
@@ -31,79 +27,47 @@ from .linear_solver import (
     solve_linear_cuda_pcg,
     solve_linear_robust,
 )
+from .options import resolve_seam_validation_settings
 from .quality import texture_gradient_weights, texture_reprojection_error
 from .sampling import sample_low_mesh
+from .solve_constraints import refine_uv_with_soft_box_constraint
 from .texture_io import resolve_device
-
-_HIGH_ISLAND_CACHE: Dict[Tuple[int, int, int, int, int, float, float], Tuple[np.ndarray, Dict[str, int]]] = {}
-_HIGH_ISLAND_CACHE_MAX = 8
 
 
 @dataclass
 class Method2InternalState:
     solve_mesh: trimesh.Trimesh
     mapped_uv_init: np.ndarray
+    mapped_uv_pre_align: np.ndarray
     face_target_jacobian: np.ndarray
     face_target_valid_mask: np.ndarray
     face_target_weights: np.ndarray
+    face_target_cov_trace: np.ndarray
+    face_smooth_alpha: np.ndarray
+    solve_face_island_labels: np.ndarray
+    solve_face_active_mask: np.ndarray
+    solve_face_expected_high_island: np.ndarray
+    solve_face_conflict_mask: np.ndarray
     face_geom_pinv: np.ndarray
     solve_sample_face_ids: np.ndarray
+    solve_sample_target_face_ids: np.ndarray
+    solve_sample_target_high_island: np.ndarray
     solve_sample_bary: np.ndarray
     solve_target_uv: np.ndarray
+    solve_sample_weights: np.ndarray
+    solve_sample_fallback_mask: np.ndarray
+    solve_constraint_row_face_ids: np.ndarray
+    solve_constraint_rhs_u: np.ndarray
+    solve_constraint_rhs_v: np.ndarray
     anchor_vertex_ids: np.ndarray
     anchor_uv: np.ndarray
+    anchor_vertex_target_uv: np.ndarray
+    anchor_vertex_confidence: np.ndarray
+    post_align_shift: np.ndarray
+    post_align_max_shift: float
     resolved_device: str
     export_payload: Dict[str, Any]
     method_stats: Dict[str, Any]
-
-
-def _cached_high_face_uv_islands(
-    *,
-    high_mesh: trimesh.Trimesh,
-    high_uv: np.ndarray,
-    position_eps: float,
-    uv_eps: float,
-    use_cache: bool,
-) -> Tuple[np.ndarray, Dict[str, int], bool]:
-    pos_eps = float(position_eps)
-    uv_eps_f = float(uv_eps)
-    if not use_cache:
-        labels, meta = compute_high_face_uv_islands(
-            vertices=np.asarray(high_mesh.vertices, dtype=np.float64),
-            faces=np.asarray(high_mesh.faces, dtype=np.int64),
-            uv=np.asarray(high_uv, dtype=np.float64),
-            position_eps=pos_eps,
-            uv_eps=uv_eps_f,
-        )
-        return labels, meta, False
-
-    key = (
-        id(high_mesh.vertices),
-        id(high_mesh.faces),
-        id(high_uv),
-        int(len(high_mesh.vertices)),
-        int(len(high_mesh.faces)),
-        round(pos_eps, 12),
-        round(uv_eps_f, 12),
-    )
-    cached = _HIGH_ISLAND_CACHE.get(key)
-    if cached is not None:
-        labels_c, meta_c = cached
-        return labels_c, dict(meta_c), True
-
-    labels, meta = compute_high_face_uv_islands(
-        vertices=np.asarray(high_mesh.vertices, dtype=np.float64),
-        faces=np.asarray(high_mesh.faces, dtype=np.int64),
-        uv=np.asarray(high_uv, dtype=np.float64),
-        position_eps=pos_eps,
-        uv_eps=uv_eps_f,
-    )
-    _HIGH_ISLAND_CACHE[key] = (labels, dict(meta))
-    if len(_HIGH_ISLAND_CACHE) > _HIGH_ISLAND_CACHE_MAX:
-        first_key = next(iter(_HIGH_ISLAND_CACHE.keys()))
-        _HIGH_ISLAND_CACHE.pop(first_key, None)
-    return labels, meta, False
-
 
 def _compute_face_geometry_pinv(mesh: trimesh.Trimesh) -> Tuple[np.ndarray, np.ndarray]:
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -560,11 +524,6 @@ def _build_gradient_constraint_system(
     max_rhs_u = float(np.max(np.abs(rhs_u_np))) if rhs_u_np.size > 0 else 0.0
     max_rhs_v = float(np.max(np.abs(rhs_v_np))) if rhs_v_np.size > 0 else 0.0
     max_target_delta = float(max(max_delta_u, max_delta_v))
-    print(f"Max target gradient/delta: {max_target_delta}")
-    print(
-        f"[method2][diag] max |delta_u|={max_delta_u:.9e}, max |delta_v|={max_delta_v:.9e}, "
-        f"max |rhs_u|={max_rhs_u:.9e}, max |rhs_v|={max_rhs_v:.9e}"
-    )
     row_face_ids_np = np.repeat(valid_faces, 3).astype(np.int64, copy=False)
 
     n_rows = int(row_face_ids_np.size)
@@ -589,6 +548,91 @@ def _build_gradient_constraint_system(
         rhs_v_np,
         row_face_ids_np,
     )
+
+
+def solve_method2_target_field_linear(
+    *,
+    solve_mesh: trimesh.Trimesh,
+    high_mesh: trimesh.Trimesh,
+    high_uv: np.ndarray,
+    resolved_device: str,
+    cfg: Dict[str, Any],
+    face_jac: np.ndarray,
+    face_weights: np.ndarray,
+    face_valid_mask: np.ndarray,
+    face_active_mask: np.ndarray,
+    face_island_labels: Optional[np.ndarray],
+    anchor_vertex_target_uv: np.ndarray,
+    anchor_vertex_confidence: np.ndarray,
+    face_smooth_alpha: np.ndarray,
+    disable_post_align: bool = True,
+) -> Dict[str, Any]:
+    A, rhs_u, rhs_v, row_face_ids = _build_gradient_constraint_system(
+        mesh=solve_mesh,
+        face_jac=np.asarray(face_jac, dtype=np.float64),
+        face_weights=np.asarray(face_weights, dtype=np.float64),
+        face_valid_mask=np.asarray(face_valid_mask, dtype=np.bool_),
+    )
+    if A.shape[0] == 0:
+        raise RuntimeError("no valid gradient constraints for target-field solve")
+
+    solve_cfg = dict(cfg.get("solve", {}))
+    m2_cfg = dict(cfg.get("method2", {}))
+    if disable_post_align:
+        m2_cfg["post_align_translation"] = False
+    precomputed_anchor_uv = nearest_vertex_uv(solve_mesh, high_mesh, high_uv).astype(np.float64)
+
+    labels = None if face_island_labels is None else np.asarray(face_island_labels, dtype=np.int64)
+    if labels is not None and np.any(labels >= 0):
+        mapped_uv, solve_meta, anchor_ids, anchor_uv = _solve_poisson_uv_by_island(
+            mesh=solve_mesh,
+            high_mesh=high_mesh,
+            high_uv=high_uv,
+            A=A,
+            rhs_u=rhs_u,
+            rhs_v=rhs_v,
+            row_face_ids=row_face_ids,
+            face_island_labels=labels,
+            solve_cfg=solve_cfg,
+            m2_cfg=m2_cfg,
+            resolved_device=resolved_device,
+            anchor_mode=str(m2_cfg.get("anchor_mode", "component_minimal")),
+            anchor_points_per_component=int(m2_cfg.get("anchor_points_per_component", 4)),
+            anchor_vertex_target_uv=np.asarray(anchor_vertex_target_uv, dtype=np.float64),
+            anchor_vertex_confidence=np.asarray(anchor_vertex_confidence, dtype=np.float64),
+            face_smooth_alpha=np.asarray(face_smooth_alpha, dtype=np.float64),
+            precomputed_anchor_uv_all=precomputed_anchor_uv,
+        )
+    else:
+        mapped_uv, solve_meta, anchor_ids, anchor_uv = _solve_poisson_uv(
+            mesh=solve_mesh,
+            high_mesh=high_mesh,
+            high_uv=high_uv,
+            A=A,
+            rhs_u=rhs_u,
+            rhs_v=rhs_v,
+            solve_cfg=solve_cfg,
+            m2_cfg=m2_cfg,
+            face_active_mask=np.asarray(face_active_mask, dtype=np.bool_),
+            resolved_device=resolved_device,
+            anchor_mode=str(m2_cfg.get("anchor_mode", "component_minimal")),
+            anchor_points_per_component=int(m2_cfg.get("anchor_points_per_component", 4)),
+            anchor_vertex_target_uv=np.asarray(anchor_vertex_target_uv, dtype=np.float64),
+            anchor_vertex_confidence=np.asarray(anchor_vertex_confidence, dtype=np.float64),
+            face_smooth_alpha=np.asarray(face_smooth_alpha, dtype=np.float64),
+            precomputed_anchor_uv_all=precomputed_anchor_uv,
+        )
+
+    return {
+        "mapped_uv": np.asarray(mapped_uv, dtype=np.float64),
+        "solve_meta": solve_meta,
+        "anchor_ids": np.asarray(anchor_ids, dtype=np.int64),
+        "anchor_uv": np.asarray(anchor_uv, dtype=np.float64),
+        "A": A,
+        "rhs_u": np.asarray(rhs_u, dtype=np.float64),
+        "rhs_v": np.asarray(rhs_v, dtype=np.float64),
+        "row_face_ids": np.asarray(row_face_ids, dtype=np.int64),
+    }
 
 
 def _boundary_vertex_ids(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -734,6 +778,7 @@ def _solve_poisson_uv(
         raise RuntimeError("method2_gradient_poisson has no valid gradient constraints")
 
     M = (A.T @ A).tocsr()
+    smooth_matrix: Optional[csr_matrix] = None
     lambda_smooth = float(solve_cfg.get("lambda_smooth", 1e-3))
     lap_mode = str(m2_cfg.get("laplacian_mode", "cotan")).strip().lower()
     if lap_mode not in {"uniform", "cotan"}:
@@ -757,7 +802,8 @@ def _solve_poisson_uv(
                 mode=lap_mode,
             )
             solve_laplacian_used = lap_mode
-        M = (M + lambda_smooth * L).tocsr()
+        smooth_matrix = (lambda_smooth * L).tocsr()
+        M = (M + smooth_matrix).tocsr()
     else:
         solve_laplacian_used = "off"
     ridge_eps = max(float(solve_cfg.get("ridge_eps", 1e-8)), 1e-8)
@@ -846,6 +892,7 @@ def _solve_poisson_uv(
 
     # Use strong soft anchors only; avoid hard Dirichlet elimination to reduce stress concentration.
     soft_anchor_ids = anchor_ids_np
+    soft_anchor_weights = np.zeros((soft_anchor_ids.size,), dtype=np.float64)
     if anchor_weight > 0.0 and soft_anchor_ids.size > 0:
         M = M.tolil(copy=False)
         conf_sel = np.clip(conf_all[soft_anchor_ids], 0.0, 1.0)
@@ -853,6 +900,7 @@ def _solve_poisson_uv(
         conf_sel = np.maximum(conf_sel, 1e-6)
         for local_idx, vid in enumerate(soft_anchor_ids.tolist()):
             wv = anchor_weight * float(conf_sel[local_idx])
+            soft_anchor_weights[local_idx] = float(wv)
             M[vid, vid] = float(M[vid, vid]) + wv
             rhs_u_full[vid] += wv * float(anchor_uv_target[vid, 0])
             rhs_v_full[vid] += wv * float(anchor_uv_target[vid, 1])
@@ -928,6 +976,21 @@ def _solve_poisson_uv(
         backend_used = "cpu_scipy"
 
     mapped_uv = np.stack([sol_u, sol_v], axis=1).astype(np.float32)
+    mapped_uv, constraint_meta = refine_uv_with_soft_box_constraint(
+        mesh=mesh,
+        uv_init=np.asarray(mapped_uv, dtype=np.float64),
+        A=A,
+        rhs_u=rhs_u,
+        rhs_v=rhs_v,
+        smooth_matrix=smooth_matrix,
+        anchor_ids=soft_anchor_ids,
+        anchor_target_uv=(
+            anchor_uv_target[soft_anchor_ids] if soft_anchor_ids.size > 0 else np.zeros((0, 2), dtype=np.float64)
+        ),
+        anchor_weights=soft_anchor_weights,
+        solve_cfg=solve_cfg,
+        resolved_device=resolved_device,
+    )
     solve_meta: Dict[str, Any] = {
         "uv_solver_backend_requested": backend_requested,
         "uv_solver_backend_used": backend_used,
@@ -946,6 +1009,7 @@ def _solve_poisson_uv(
         "uv_solver_refine_cg_info_u": int(meta_u.get("cg2_info", 0)),
         "uv_solver_refine_cg_info_v": int(meta_v.get("cg2_info", 0)),
     }
+    solve_meta.update(constraint_meta)
     if fallback_reason:
         solve_meta["uv_solver_fallback_reason"] = fallback_reason
 
@@ -1064,6 +1128,19 @@ def _solve_poisson_uv_by_island(
     cg2_info_v: list[int] = []
     cond_proxy: list[float] = []
     lap_used: list[str] = []
+    constraint_mode_list: list[str] = []
+    constraint_status_list: list[str] = []
+    constraint_device_list: list[str] = []
+    constraint_stop_reason_list: list[str] = []
+    constraint_applied_list: list[bool] = []
+    constraint_iters_list: list[int] = []
+    constraint_energy_init_list: list[float] = []
+    constraint_energy_final_list: list[float] = []
+    constraint_energy_box_final_list: list[float] = []
+    constraint_vertex_oob_init_list: list[float] = []
+    constraint_vertex_oob_final_list: list[float] = []
+    constraint_face_oob_init_list: list[float] = []
+    constraint_face_oob_final_list: list[float] = []
 
     anchor_map: Dict[int, np.ndarray] = {}
 
@@ -1171,6 +1248,26 @@ def _solve_poisson_uv_by_island(
             if np.isfinite(cp_f):
                 cond_proxy.append(cp_f)
         lap_used.append(str(meta_local.get("uv_m2_laplacian_mode", "unknown")))
+        constraint_mode_list.append(str(meta_local.get("uv_solver_constraint_mode", "none")))
+        constraint_status_list.append(str(meta_local.get("uv_solver_constraint_status", "unknown")))
+        constraint_device_list.append(str(meta_local.get("uv_solver_constraint_device", "unknown")))
+        constraint_stop_reason_list.append(str(meta_local.get("uv_solver_constraint_stop_reason", "unknown")))
+        constraint_applied_list.append(bool(meta_local.get("uv_solver_constraint_applied", False)))
+        constraint_iters_list.append(int(meta_local.get("uv_solver_constraint_iters", 0)))
+        for raw, out in [
+            (meta_local.get("uv_solver_constraint_energy_init"), constraint_energy_init_list),
+            (meta_local.get("uv_solver_constraint_energy_final"), constraint_energy_final_list),
+            (meta_local.get("uv_solver_constraint_energy_box_final"), constraint_energy_box_final_list),
+            (meta_local.get("uv_solver_constraint_vertex_oob_ratio_init"), constraint_vertex_oob_init_list),
+            (meta_local.get("uv_solver_constraint_vertex_oob_ratio_final"), constraint_vertex_oob_final_list),
+            (meta_local.get("uv_solver_constraint_face_oob_ratio_init"), constraint_face_oob_init_list),
+            (meta_local.get("uv_solver_constraint_face_oob_ratio_final"), constraint_face_oob_final_list),
+        ]:
+            if raw is None:
+                continue
+            val = float(raw)
+            if np.isfinite(val):
+                out.append(val)
 
     if solved_islands == 0:
         raise RuntimeError("method2 island solve failed: no island sub-problem solved")
@@ -1182,6 +1279,11 @@ def _solve_poisson_uv_by_island(
         if len(uniq) == 1:
             return uniq[0]
         return "mixed"
+
+    def _mean_or_none(vals: list[float]) -> Optional[float]:
+        if len(vals) == 0:
+            return None
+        return float(np.mean(np.asarray(vals, dtype=np.float64)))
 
     anchor_ids = np.asarray(sorted(anchor_map.keys()), dtype=np.int64) if anchor_map else np.zeros((0,), dtype=np.int64)
     anchor_uv = (
@@ -1221,6 +1323,19 @@ def _solve_poisson_uv_by_island(
         "uv_m2_hard_anchor_conf_min": float(m2_cfg.get("hard_anchor_conf_min", 0.85)),
         "uv_m2_hard_anchor_count": 0,
         "uv_m2_soft_anchor_count": int(anchor_ids.size),
+        "uv_solver_constraint_mode": _mode_or_mixed(constraint_mode_list),
+        "uv_solver_constraint_status": _mode_or_mixed(constraint_status_list),
+        "uv_solver_constraint_device": _mode_or_mixed(constraint_device_list),
+        "uv_solver_constraint_stop_reason": _mode_or_mixed(constraint_stop_reason_list),
+        "uv_solver_constraint_applied": bool(any(constraint_applied_list)) if constraint_applied_list else False,
+        "uv_solver_constraint_iters": int(max(constraint_iters_list)) if constraint_iters_list else 0,
+        "uv_solver_constraint_energy_init": _mean_or_none(constraint_energy_init_list),
+        "uv_solver_constraint_energy_final": _mean_or_none(constraint_energy_final_list),
+        "uv_solver_constraint_energy_box_final": _mean_or_none(constraint_energy_box_final_list),
+        "uv_solver_constraint_vertex_oob_ratio_init": _mean_or_none(constraint_vertex_oob_init_list),
+        "uv_solver_constraint_vertex_oob_ratio_final": _mean_or_none(constraint_vertex_oob_final_list),
+        "uv_solver_constraint_face_oob_ratio_init": _mean_or_none(constraint_face_oob_init_list),
+        "uv_solver_constraint_face_oob_ratio_final": _mean_or_none(constraint_face_oob_final_list),
     }
     if len(cond_proxy) > 0:
         solve_meta["uv_m2_system_cond_proxy"] = float(np.mean(cond_proxy))
@@ -1267,9 +1382,10 @@ def run_method2_gradient_poisson(
     if seam_strategy_requested not in {"legacy", "halfedge_island"}:
         seam_strategy_requested = "legacy"
     emit_validation_sidecar_data = bool(seam_cfg.get("emit_validation_sidecar_data", False))
-    seam_validation_strict = bool(seam_cfg.get("validation_strict", True))
-    seam_require_closed = bool(seam_cfg.get("validation_require_closed_loops", True))
-    seam_require_partition_pure = bool(seam_cfg.get("validation_require_pure_components", True))
+    validation = resolve_seam_validation_settings(seam_cfg)
+    seam_validation_strict = bool(validation.strict)
+    seam_require_closed = bool(validation.require_closed_loops)
+    seam_require_partition_pure = bool(validation.require_pure_components)
 
     resolved = resolve_device(device)
     if resolved != "cuda":
@@ -1288,12 +1404,179 @@ def run_method2_gradient_poisson(
             return_internal=return_internal,
         )
 
+    high_ctx = build_high_cuda_context(high_mesh=high_mesh, high_uv=high_uv, device=resolved)
+    runtime_meta = dict(high_ctx.get("runtime_diag") or {})
+    runtime_meta.pop("reason", None)
     work_low_mesh = low_mesh
-    pre_seam_meta: Dict[str, Any] = {}
+    solve_mesh = work_low_mesh
+    seam_strategy_effective = seam_strategy_requested
+    seam_strategy_used = seam_strategy_requested
+    split_vertices_out: Optional[np.ndarray] = None
+    split_faces_out: Optional[np.ndarray] = None
+
+    t_island_start = time.perf_counter()
+    high_face_island = None
+    low_face_island = np.zeros((0,), dtype=np.int64)
+    low_face_conflict = np.zeros((0,), dtype=np.bool_)
+    low_face_confidence = np.zeros((0,), dtype=np.float32)
+    low_face_pre_bfs_label = np.zeros((0,), dtype=np.int64)
+    low_face_pre_bfs_confidence = np.zeros((0,), dtype=np.float32)
+    low_face_pre_bfs_state = np.zeros((0,), dtype=np.uint8)
+    low_face_pre_cleanup_label = np.zeros((0,), dtype=np.int64)
+    low_face_pre_cleanup_confidence = np.zeros((0,), dtype=np.float32)
+    low_face_pre_cleanup_conflict = np.zeros((0,), dtype=np.bool_)
+    low_face_soft_top1_label = np.zeros((0,), dtype=np.int64)
+    low_face_soft_top1_prob = np.zeros((0,), dtype=np.float32)
+    low_face_soft_top2_label = np.zeros((0,), dtype=np.int64)
+    low_face_soft_top2_prob = np.zeros((0,), dtype=np.float32)
+    low_face_soft_entropy = np.zeros((0,), dtype=np.float32)
+    low_face_soft_candidate_count = np.zeros((0,), dtype=np.int32)
+    low_face_expected_high = np.zeros((0,), dtype=np.int64)
+    seam_edges_for_export = np.zeros((0, 2), dtype=np.int64)
+    seam_meta: Dict[str, Any] = {}
+    seam_meta.update(runtime_meta)
+    seam_meta["uv_island_conflict_policy"] = "drop_conflict_and_unknown_samples"
+    seam_meta["uv_halfedge_split_requested"] = bool(seam_strategy_requested == "halfedge_island")
+    seam_meta["uv_halfedge_split_topology_applied"] = False
+    seam_meta["uv_halfedge_split_fallback_to_legacy"] = False
+    seam_meta["uv_island_validation_mode"] = validation.mode
+    seam_meta["uv_seam_validation_strict"] = bool(seam_validation_strict)
+    seam_meta["uv_seam_validation_require_closed_loops"] = bool(seam_require_closed)
+    seam_meta["uv_seam_validation_require_pure_components"] = bool(seam_require_partition_pure)
+
+    def _attach_semantic_validation_sidecar_fields(stats: Dict[str, Any]) -> None:
+        stats["uv_seam_strategy_requested"] = seam_strategy_requested
+        stats["uv_seam_strategy_effective"] = seam_strategy_effective
+        stats["uv_seam_strategy_used"] = seam_strategy_used
+        if not emit_validation_sidecar_data or seam_strategy_used != "halfedge_island":
+            return
+        stats["uv_low_face_semantic_labels"] = low_face_island.astype(np.int64, copy=False).tolist()
+        stats["uv_low_face_semantic_confidence"] = low_face_confidence.astype(np.float32, copy=False).tolist()
+        stats["uv_low_face_semantic_conflict"] = low_face_conflict.astype(np.bool_, copy=False).tolist()
+        stats["uv_low_face_semantic_pre_bfs_labels"] = low_face_pre_bfs_label.astype(np.int64, copy=False).tolist()
+        stats["uv_low_face_semantic_pre_bfs_confidence"] = low_face_pre_bfs_confidence.astype(
+            np.float32, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_pre_bfs_state"] = low_face_pre_bfs_state.astype(np.uint8, copy=False).tolist()
+        stats["uv_low_face_semantic_pre_cleanup_labels"] = low_face_pre_cleanup_label.astype(
+            np.int64, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_pre_cleanup_confidence"] = low_face_pre_cleanup_confidence.astype(
+            np.float32, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_pre_cleanup_conflict"] = low_face_pre_cleanup_conflict.astype(
+            np.bool_, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_soft_top1_label"] = low_face_soft_top1_label.astype(
+            np.int64, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_soft_top1_prob"] = low_face_soft_top1_prob.astype(
+            np.float32, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_soft_top2_label"] = low_face_soft_top2_label.astype(
+            np.int64, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_soft_top2_prob"] = low_face_soft_top2_prob.astype(
+            np.float32, copy=False
+        ).tolist()
+        stats["uv_low_face_semantic_soft_entropy"] = low_face_soft_entropy.astype(np.float32, copy=False).tolist()
+        stats["uv_low_face_semantic_soft_candidate_count"] = low_face_soft_candidate_count.astype(
+            np.int32, copy=False
+        ).tolist()
+        stats["uv_low_seam_edges"] = seam_edges_for_export.astype(np.int64, copy=False).tolist()
+
+    island_cache_enabled = bool(m2_cfg.get("perf_fast_island_cache", True))
     if seam_strategy_requested == "halfedge_island":
-        ensure_halfedge_external_dependencies()
-        work_low_mesh, sanitize_meta = sanitize_mesh_for_halfedge(low_mesh=low_mesh, seam_cfg=seam_cfg)
-        pre_seam_meta.update(sanitize_meta)
+        island_result = run_halfedge_island_pipeline(
+            high_mesh=high_mesh,
+            high_uv=high_uv,
+            low_mesh=low_mesh,
+            high_ctx=high_ctx,
+            seam_cfg=seam_cfg,
+            corr_cfg=corr_cfg,
+            use_high_island_cache=island_cache_enabled,
+        )
+        work_low_mesh = island_result.low_mesh
+        solve_mesh = island_result.solve_mesh
+        seam_meta.update(island_result.meta)
+        if island_result.high is not None:
+            high_face_island = island_result.high.face_labels.astype(np.int64, copy=False)
+        if island_result.semantic is not None:
+            low_face_island = island_result.semantic.face_labels.astype(np.int64, copy=False)
+            low_face_conflict = island_result.semantic.face_conflict.astype(np.bool_, copy=False)
+            low_face_confidence = island_result.semantic.face_confidence.astype(np.float32, copy=False)
+            low_face_pre_bfs_label = island_result.semantic.pre_bfs_labels.astype(np.int64, copy=False)
+            low_face_pre_bfs_confidence = island_result.semantic.pre_bfs_confidence.astype(np.float32, copy=False)
+            low_face_pre_bfs_state = island_result.semantic.pre_bfs_state.astype(np.uint8, copy=False)
+            if island_result.semantic.pre_cleanup_labels is not None:
+                low_face_pre_cleanup_label = island_result.semantic.pre_cleanup_labels.astype(np.int64, copy=False)
+            if island_result.semantic.pre_cleanup_confidence is not None:
+                low_face_pre_cleanup_confidence = island_result.semantic.pre_cleanup_confidence.astype(
+                    np.float32, copy=False
+                )
+            if island_result.semantic.pre_cleanup_conflict is not None:
+                low_face_pre_cleanup_conflict = island_result.semantic.pre_cleanup_conflict.astype(
+                    np.bool_, copy=False
+                )
+            if island_result.semantic.soft_top1_label is not None:
+                low_face_soft_top1_label = island_result.semantic.soft_top1_label.astype(np.int64, copy=False)
+            if island_result.semantic.soft_top1_prob is not None:
+                low_face_soft_top1_prob = island_result.semantic.soft_top1_prob.astype(np.float32, copy=False)
+            if island_result.semantic.soft_top2_label is not None:
+                low_face_soft_top2_label = island_result.semantic.soft_top2_label.astype(np.int64, copy=False)
+            if island_result.semantic.soft_top2_prob is not None:
+                low_face_soft_top2_prob = island_result.semantic.soft_top2_prob.astype(np.float32, copy=False)
+            if island_result.semantic.soft_entropy is not None:
+                low_face_soft_entropy = island_result.semantic.soft_entropy.astype(np.float32, copy=False)
+            if island_result.semantic.soft_candidate_count is not None:
+                low_face_soft_candidate_count = island_result.semantic.soft_candidate_count.astype(np.int32, copy=False)
+            low_face_expected_high = low_face_island.astype(np.int64, copy=False)
+        if island_result.seam is not None:
+            seam_edges_for_export = island_result.seam.seam_edges.astype(np.int64, copy=False)
+        if island_result.split is not None:
+            split_vertices_out = island_result.split.split_vertices
+            split_faces_out = island_result.split.split_faces
+        seam_strategy_effective = "halfedge_island"
+        seam_strategy_used = "halfedge_island"
+        if high_face_island is None:
+            if seam_validation_strict:
+                raise RuntimeError(
+                    "halfedge_island failed: "
+                    + str(island_result.validation_error or seam_meta.get("uv_high_island_error", "unknown error"))
+                )
+            mapped_uv, stats = barycentric_mapper(high_mesh, work_low_mesh, high_uv, resolved, cfg)
+            stats["uv_mode_used"] = "method2_fallback_halfedge_island_error"
+            stats["uv_project_error"] = str(
+                island_result.validation_error or seam_meta.get("uv_high_island_error", "halfedge_island failed")
+            )
+            seam_strategy_effective = "fallback_legacy"
+            seam_strategy_used = "fallback_legacy"
+            _attach_semantic_validation_sidecar_fields(stats)
+            stats.update(seam_meta)
+            return _package_method2_result(
+                mapped_uv=mapped_uv,
+                stats=stats,
+                quality_mesh=work_low_mesh,
+                return_internal=return_internal,
+            )
+    else:
+        seam_meta["uv_m2_perf_high_island_cache_enabled"] = island_cache_enabled
+        seam_meta["uv_m2_perf_high_island_cache_hit"] = False
+        try:
+            high_face_island, high_meta, cache_hit = compute_cached_high_face_uv_islands(
+                high_mesh=high_mesh,
+                high_uv=high_uv,
+                position_eps=float(seam_cfg.get("high_position_eps", 1e-6)),
+                uv_eps=float(seam_cfg.get("high_uv_eps", 1e-5)),
+                use_cache=island_cache_enabled,
+            )
+            seam_meta["uv_m2_perf_high_island_cache_hit"] = bool(cache_hit)
+            seam_meta["uv_high_island_count"] = int(high_meta.get("high_island_count", 0))
+            seam_meta["uv_high_seam_edges"] = int(high_meta.get("high_seam_edges", 0))
+            seam_meta["uv_high_boundary_edges"] = int(high_meta.get("high_boundary_edges", 0))
+            seam_meta["uv_high_nonmanifold_edges"] = int(high_meta.get("high_nonmanifold_edges", 0))
+        except Exception as exc:
+            seam_meta["uv_high_island_error"] = str(exc)
 
     sample = sample_low_mesh(work_low_mesh, cfg["sample"])
     sample_points = sample["points"]
@@ -1302,7 +1585,6 @@ def run_method2_gradient_poisson(
     sample_normals = sample["normals"]
     sample_area_weights = sample["area_weights"]
 
-    high_ctx = build_high_cuda_context(high_mesh=high_mesh, high_uv=high_uv, device=resolved)
     correspondence = correspond_points_hybrid(
         points=sample_points,
         point_normals=sample_normals,
@@ -1316,129 +1598,42 @@ def run_method2_gradient_poisson(
     fallback_used_mask = correspondence["fallback_used_mask"]
 
     n_faces = int(len(work_low_mesh.faces))
-    solve_mesh = work_low_mesh
     face_active_mask = np.ones((n_faces,), dtype=np.bool_)
     solver_valid_mask = valid_mask.copy()
-    seam_strategy_effective = seam_strategy_requested
-    seam_strategy_used = "method2_ideal_noguard"
-    split_vertices_out: Optional[np.ndarray] = None
-    split_faces_out: Optional[np.ndarray] = None
+    if low_face_island.shape[0] != n_faces:
+        low_face_island = np.full((n_faces,), -1, dtype=np.int64)
+    if low_face_conflict.shape[0] != n_faces:
+        low_face_conflict = np.zeros((n_faces,), dtype=np.bool_)
+    if low_face_confidence.shape[0] != n_faces:
+        low_face_confidence = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_pre_bfs_label.shape[0] != n_faces:
+        low_face_pre_bfs_label = np.full((n_faces,), -1, dtype=np.int64)
+    if low_face_pre_bfs_confidence.shape[0] != n_faces:
+        low_face_pre_bfs_confidence = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_pre_bfs_state.shape[0] != n_faces:
+        low_face_pre_bfs_state = np.zeros((n_faces,), dtype=np.uint8)
+    if low_face_pre_cleanup_label.shape[0] != n_faces:
+        low_face_pre_cleanup_label = np.full((n_faces,), -1, dtype=np.int64)
+    if low_face_pre_cleanup_confidence.shape[0] != n_faces:
+        low_face_pre_cleanup_confidence = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_pre_cleanup_conflict.shape[0] != n_faces:
+        low_face_pre_cleanup_conflict = np.zeros((n_faces,), dtype=np.bool_)
+    if low_face_soft_top1_label.shape[0] != n_faces:
+        low_face_soft_top1_label = np.full((n_faces,), -1, dtype=np.int64)
+    if low_face_soft_top1_prob.shape[0] != n_faces:
+        low_face_soft_top1_prob = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_soft_top2_label.shape[0] != n_faces:
+        low_face_soft_top2_label = np.full((n_faces,), -1, dtype=np.int64)
+    if low_face_soft_top2_prob.shape[0] != n_faces:
+        low_face_soft_top2_prob = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_soft_entropy.shape[0] != n_faces:
+        low_face_soft_entropy = np.zeros((n_faces,), dtype=np.float32)
+    if low_face_soft_candidate_count.shape[0] != n_faces:
+        low_face_soft_candidate_count = np.zeros((n_faces,), dtype=np.int32)
+    if low_face_expected_high.shape[0] != n_faces:
+        low_face_expected_high = np.full((n_faces,), -1, dtype=np.int64)
 
-    t_island_start = time.perf_counter()
-    high_face_island = None
-    low_face_island = np.full((n_faces,), -1, dtype=np.int64)
-    low_face_conflict = np.zeros((n_faces,), dtype=np.bool_)
-    low_face_confidence = np.zeros((n_faces,), dtype=np.float32)
-    low_face_expected_high = np.full((n_faces,), -1, dtype=np.int64)
-    seam_edges_for_export = np.zeros((0, 2), dtype=np.int64)
-    seam_meta: Dict[str, Any] = {}
-    seam_meta.update(pre_seam_meta)
-    seam_meta["uv_island_conflict_policy"] = "drop_conflict_and_unknown_samples"
-    seam_meta["uv_halfedge_split_requested"] = bool(seam_strategy_requested == "halfedge_island")
-    seam_meta["uv_halfedge_split_topology_applied"] = False
-    seam_meta["uv_halfedge_split_fallback_to_legacy"] = False
-    seam_meta["uv_seam_validation_strict"] = bool(seam_validation_strict)
-    seam_meta["uv_seam_validation_require_closed_loops"] = bool(seam_require_closed)
-    seam_meta["uv_seam_validation_require_pure_components"] = bool(seam_require_partition_pure)
-    island_cache_enabled = bool(m2_cfg.get("perf_fast_island_cache", True))
-    seam_meta["uv_m2_perf_high_island_cache_enabled"] = island_cache_enabled
-    seam_meta["uv_m2_perf_high_island_cache_hit"] = False
-    try:
-        high_face_island, high_meta, cache_hit = _cached_high_face_uv_islands(
-            high_mesh=high_mesh,
-            high_uv=high_uv,
-            position_eps=float(seam_cfg.get("high_position_eps", 1e-6)),
-            uv_eps=float(seam_cfg.get("high_uv_eps", 1e-5)),
-            use_cache=island_cache_enabled,
-        )
-        seam_meta["uv_m2_perf_high_island_cache_hit"] = bool(cache_hit)
-        seam_meta["uv_high_island_count"] = int(high_meta.get("high_island_count", 0))
-        seam_meta["uv_high_seam_edges"] = int(high_meta.get("high_seam_edges", 0))
-        seam_meta["uv_high_boundary_edges"] = int(high_meta.get("high_boundary_edges", 0))
-        seam_meta["uv_high_nonmanifold_edges"] = int(high_meta.get("high_nonmanifold_edges", 0))
-    except Exception as exc:
-        seam_meta["uv_high_island_error"] = str(exc)
-
-    if high_face_island is None and seam_strategy_requested == "halfedge_island":
-        if seam_validation_strict:
-            raise RuntimeError("halfedge_island failed: unable to compute high-face UV islands")
-        mapped_uv, stats = barycentric_mapper(high_mesh, work_low_mesh, high_uv, resolved, cfg)
-        stats["uv_mode_used"] = "method2_fallback_halfedge_island_error"
-        stats["uv_project_error"] = "halfedge_island failed: unable to compute high-face UV islands"
-        stats["uv_seam_strategy_requested"] = seam_strategy_requested
-        stats["uv_seam_strategy_effective"] = "halfedge_island_failed"
-        stats["uv_seam_strategy_used"] = "method2_halfedge_failed"
-        stats.update(seam_meta)
-        return _package_method2_result(
-            mapped_uv=mapped_uv,
-            stats=stats,
-            quality_mesh=work_low_mesh,
-            return_internal=return_internal,
-        )
-
-    if high_face_island is not None and seam_strategy_requested == "halfedge_island":
-        seam_strategy_effective = "halfedge_island"
-        semantic = transfer_face_semantics_by_projection(
-            high_ctx=high_ctx,
-            high_face_island=high_face_island,
-            low_mesh=work_low_mesh,
-            seam_cfg=seam_cfg,
-            corr_cfg=corr_cfg,
-        )
-        low_face_island = np.asarray(semantic["low_face_island"], dtype=np.int64, copy=False)
-        low_face_conflict = np.asarray(semantic["low_face_conflict"], dtype=np.bool_, copy=False)
-        low_face_confidence = np.asarray(semantic["low_face_confidence"], dtype=np.float32, copy=False)
-        low_face_expected_high = low_face_island.astype(np.int64, copy=False)
-        seam_meta.update(dict(semantic.get("meta", {})))
-        seam_meta["uv_halfedge_backend"] = "openmesh"
-
-        seam_result = extract_seam_edges_openmesh(
-            low_mesh=work_low_mesh,
-            face_labels=low_face_island,
-            include_boundary_as_seam=bool(seam_cfg.get("include_boundary_as_seam", False)),
-        )
-        seam_edges = np.asarray(seam_result.seam_edges, dtype=np.int64, copy=False)
-        seam_edges_for_export = seam_edges.astype(np.int64, copy=False)
-        seam_meta.update(dict(seam_result.meta))
-        partition_meta = validate_face_partition_by_seams(
-            low_mesh=work_low_mesh,
-            face_labels=low_face_island,
-            seam_edges=seam_edges,
-        )
-        seam_meta.update(partition_meta)
-        seam_topology_ok = bool(seam_result.meta.get("uv_seam_topology_valid", False)) or (not seam_require_closed)
-        seam_partition_ok = bool(partition_meta.get("uv_seam_partition_is_valid", False)) or (
-            not seam_require_partition_pure
-        )
-        seam_validation_ok = bool(seam_topology_ok and seam_partition_ok)
-        seam_meta["uv_seam_validation_ok"] = bool(seam_validation_ok)
-        if not seam_validation_ok:
-            seam_meta["uv_seam_validation_error"] = (
-                f"topology_ok={seam_topology_ok}, partition_ok={seam_partition_ok}, "
-                f"components_open={int(seam_result.meta.get('uv_seam_components_open', 0))}, "
-                f"mixed_components={int(partition_meta.get('uv_seam_partition_mixed_components', 0))}"
-            )
-            if seam_validation_strict:
-                raise RuntimeError(f"halfedge seam validation failed: {seam_meta['uv_seam_validation_error']}")
-
-        split_vertices, split_faces, split_meta = split_vertices_along_cut_edges(
-            vertices=np.asarray(work_low_mesh.vertices, dtype=np.float32),
-            faces=np.asarray(work_low_mesh.faces, dtype=np.int64),
-            cut_edges=seam_edges,
-        )
-        seam_meta["uv_low_cut_edges"] = int(split_meta.get("cut_edges", seam_edges.shape[0]))
-        seam_meta["uv_low_split_vertices"] = int(split_meta.get("split_vertices_added", 0))
-        seam_meta["uv_low_split_faces"] = int(split_meta.get("split_faces", n_faces))
-        seam_meta["uv_island_conflict_faces"] = int(np.count_nonzero(low_face_conflict))
-        seam_meta["uv_island_unknown_faces"] = int(np.count_nonzero(low_face_island < 0))
-        seam_meta["uv_island_conflict_faces_excluded"] = 0
-        if int(split_vertices.shape[0]) > int(len(work_low_mesh.vertices)):
-            solve_mesh = trimesh.Trimesh(vertices=split_vertices, faces=split_faces, process=False)
-            split_vertices_out = split_vertices
-            split_faces_out = split_faces
-            seam_meta["uv_halfedge_split_topology_applied"] = True
-        seam_strategy_used = "method2_halfedge_semantic_openmesh"
-    elif high_face_island is not None:
+    if seam_strategy_requested != "halfedge_island" and high_face_island is not None:
         low_face_island, low_face_conflict, low_face_confidence = major_face_island_labels(
             sample_face_ids=sample_face_ids,
             target_face_ids=target_face_ids,
@@ -1480,6 +1675,9 @@ def run_method2_gradient_poisson(
         seam_meta.setdefault("uv_low_split_vertices", 0)
         seam_meta.setdefault("uv_low_split_faces", int(n_faces))
         low_face_expected_high = low_face_island.astype(np.int64, copy=False)
+
+    if not seam_strategy_effective:
+        seam_strategy_effective = seam_strategy_used
 
     if seam_strategy_effective == "halfedge_island":
         cross_seam_face_mask = np.zeros((n_faces,), dtype=np.bool_)
@@ -1549,7 +1747,6 @@ def run_method2_gradient_poisson(
 
     high_face_jac, high_face_jac_valid = _compute_high_face_jacobians(high_mesh, high_uv)
     J_high = high_face_jac[high_face_jac_valid] if np.any(high_face_jac_valid) else high_face_jac
-    print(np.linalg.norm(J_high))
     _print_local_frame_length_diagnostics(high_mesh, tag="high_mesh")
     target_face_ok = (target_face_ids >= 0) & (target_face_ids < len(high_face_jac_valid))
     solver_valid_mask &= target_face_ok
@@ -1606,7 +1803,7 @@ def run_method2_gradient_poisson(
         stats["uv_m2_poisson_residual_v"] = None
         stats["uv_m2_boundary_anchor_count"] = 0
         stats["uv_m2_outlier_reject_ratio"] = 0.0
-        stats["uv_seam_strategy_used"] = seam_strategy_used
+        _attach_semantic_validation_sidecar_fields(stats)
         stats.update(seam_meta)
         if emit_face_sample_counts and face_accepted_samples is not None:
             stats["uv_m2_face_accepted_samples"] = face_accepted_samples.tolist()
@@ -1626,9 +1823,13 @@ def run_method2_gradient_poisson(
     starget_uv = target_uv[valid_ids].astype(np.float64, copy=False)
     sarea_w = sample_area_weights[valid_ids].astype(np.float64, copy=False)
     sfallback = fallback_used_mask[valid_ids]
+    sample_target_high_island = np.full((len(valid_ids),), -1, dtype=np.int64)
+    if high_face_island is not None and tf.size > 0:
+        ok_high_island = (tf >= 0) & (tf < len(high_face_island))
+        if np.any(ok_high_island):
+            sample_target_high_island[ok_high_island] = high_face_island[tf[ok_high_island]]
     if tf.size > 0:
         J_high = high_face_jac[tf]
-        print(np.linalg.norm(J_high))
 
     corr_w = np.ones((len(valid_ids),), dtype=np.float64)
     corr_w[sfallback] = float(corr_cfg.get("fallback_weight", 0.7))
@@ -1781,7 +1982,7 @@ def run_method2_gradient_poisson(
         stats["uv_m2_constraint_relaxation_used"] = bool(outlier_meta.get("uv_m2_constraint_relaxation_used", False))
         stats["uv_solve_num_constraints"] = int(A.shape[0])
         stats["uv_solve_num_samples"] = int(len(sf))
-        stats["uv_seam_strategy_used"] = seam_strategy_used
+        _attach_semantic_validation_sidecar_fields(stats)
         stats.update(seam_meta)
         if emit_face_sample_counts and face_accepted_samples is not None:
             stats["uv_m2_face_accepted_samples"] = face_accepted_samples.tolist()
@@ -1854,7 +2055,7 @@ def run_method2_gradient_poisson(
         stats["uv_m2_anchor_count_total"] = 0
         stats["uv_solve_num_constraints"] = int(A.shape[0])
         stats["uv_solve_num_samples"] = int(len(sf))
-        stats["uv_seam_strategy_used"] = seam_strategy_used
+        _attach_semantic_validation_sidecar_fields(stats)
         stats.update(seam_meta)
         stats.update(outlier_meta)
         if emit_face_sample_counts and face_accepted_samples is not None:
@@ -1884,6 +2085,7 @@ def run_method2_gradient_poisson(
     post_align_max_shift = max(0.0, float(m2_cfg.get("post_align_max_shift", 0.25)))
     post_align_applied = False
     post_align_shift = np.zeros((2,), dtype=np.float64)
+    mapped_uv_pre_align = np.asarray(mapped_uv, dtype=np.float32).copy()
     if post_align_enabled and residual_pre.shape[0] >= post_align_min_samples:
         shift = pre_shift_median.astype(np.float64, copy=True)
         shift_norm = float(np.linalg.norm(shift))
@@ -1975,9 +2177,7 @@ def run_method2_gradient_poisson(
         method_stats["uv_m2_face_accepted_samples"] = face_accepted_samples.tolist()
         if face_total_samples is not None:
             method_stats["uv_m2_face_total_samples"] = face_total_samples.tolist()
-    if emit_validation_sidecar_data and seam_strategy_effective == "halfedge_island":
-        method_stats["uv_low_face_semantic_labels"] = low_face_island.astype(np.int64, copy=False).tolist()
-        method_stats["uv_low_seam_edges"] = seam_edges_for_export.astype(np.int64, copy=False).tolist()
+    _attach_semantic_validation_sidecar_fields(method_stats)
 
     export_payload: Dict[str, Any] = {
         "local_vertex_split_applied": False,
@@ -2007,15 +2207,33 @@ def run_method2_gradient_poisson(
     internal = Method2InternalState(
         solve_mesh=solve_mesh,
         mapped_uv_init=mapped_uv.copy(),
+        mapped_uv_pre_align=mapped_uv_pre_align,
         face_target_jacobian=face_jac.astype(np.float32),
         face_target_valid_mask=face_valid.astype(np.bool_),
         face_target_weights=face_weights.astype(np.float32),
+        face_target_cov_trace=face_cov_trace.astype(np.float32),
+        face_smooth_alpha=face_alpha.astype(np.float32),
+        solve_face_island_labels=low_face_island.astype(np.int64, copy=False),
+        solve_face_active_mask=face_active_mask.astype(np.bool_, copy=False),
+        solve_face_expected_high_island=low_face_expected_high.astype(np.int64, copy=False),
+        solve_face_conflict_mask=low_face_conflict.astype(np.bool_, copy=False),
         face_geom_pinv=face_geom_pinv.astype(np.float32),
         solve_sample_face_ids=sf.astype(np.int64),
+        solve_sample_target_face_ids=tf.astype(np.int64),
+        solve_sample_target_high_island=sample_target_high_island.astype(np.int64),
         solve_sample_bary=sbary.astype(np.float32),
         solve_target_uv=starget_uv.astype(np.float32),
+        solve_sample_weights=sample_weights.astype(np.float32),
+        solve_sample_fallback_mask=sfallback.astype(np.bool_),
+        solve_constraint_row_face_ids=row_face_ids.astype(np.int64),
+        solve_constraint_rhs_u=rhs_u.astype(np.float32),
+        solve_constraint_rhs_v=rhs_v.astype(np.float32),
         anchor_vertex_ids=anchor_ids.astype(np.int64),
         anchor_uv=anchor_uv.astype(np.float32),
+        anchor_vertex_target_uv=anchor_vertex_target_uv.astype(np.float32),
+        anchor_vertex_confidence=anchor_vertex_conf_norm.astype(np.float32),
+        post_align_shift=post_align_shift.astype(np.float32),
+        post_align_max_shift=float(post_align_max_shift),
         resolved_device=resolved,
         export_payload=export_payload,
         method_stats=method_stats,
@@ -2026,4 +2244,5 @@ def run_method2_gradient_poisson(
 __all__ = [
     "Method2InternalState",
     "run_method2_gradient_poisson",
+    "solve_method2_target_field_linear",
 ]

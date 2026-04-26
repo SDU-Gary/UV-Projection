@@ -9,10 +9,10 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 import trimesh
 
+from .atom3d_runtime import ensure_atom3d_cuda_runtime, merge_runtime_diag
+from .decimation import decimate_with_pymeshlab_qem
 from ..mesh_io import MeshIO
 from ..types import ReconstructionArtifact
-
-_ATOM3D_KERNEL_DIAG_CACHE: Optional[Dict[str, Any]] = None
 
 
 class ReconstructionService:
@@ -32,6 +32,8 @@ class ReconstructionService:
         retry_resolutions: Optional[Iterable[int]] = None,
         min_level: int = -1,
         solver_weights: Optional[Dict[str, float]] = None,
+        backend: str = "faithc",
+        decimation_options: Optional[Dict[str, Any]] = None,
     ) -> ReconstructionArtifact:
         if resolution <= 0 or (resolution & (resolution - 1)) != 0:
             raise ValueError(f"resolution must be power of two, got: {resolution}")
@@ -44,6 +46,47 @@ class ReconstructionService:
 
         high_mesh_normalized_path = output_dir / "mesh_high_normalized.glb"
         MeshIO.export_mesh(mesh_high, high_mesh_normalized_path)
+
+        backend_name = str(backend).strip().lower()
+        if backend_name not in {"faithc", "pymeshlab_qem"}:
+            raise ValueError(f"Unsupported reconstruction backend: {backend}")
+
+        if backend_name == "pymeshlab_qem":
+            t0 = time.perf_counter()
+            decimated = decimate_with_pymeshlab_qem(
+                mesh_high,
+                **dict(decimation_options or {}),
+            )
+            low_mesh_path = output_dir / "mesh_low.glb"
+            MeshIO.export_mesh(decimated.mesh_low, low_mesh_path)
+            total_seconds = round(time.perf_counter() - t0, 6)
+            stats: Dict[str, Any] = {
+                "reconstruction_backend_requested": backend_name,
+                "reconstruction_backend_used": backend_name,
+                "resolution_requested": int(resolution),
+                "resolution": None,
+                "resolution_used": None,
+                "tri_mode": tri_mode,
+                "retry_on_empty_mesh": False,
+                "resolution_attempts": [],
+                "reconstruction_retry_count": 0,
+                "attempts": [],
+                "kernel_diag": None,
+                "runtime_diag": None,
+                "encode_seconds": 0.0,
+                "decode_seconds": 0.0,
+                "total_seconds": total_seconds,
+                **decimated.stats,
+            }
+            with (output_dir / "reconstruction_stats.json").open("w", encoding="utf-8") as handle:
+                json.dump(stats, handle, indent=2)
+            return ReconstructionArtifact(
+                sample_name=sample_name,
+                high_mesh_normalized_path=high_mesh_normalized_path,
+                low_mesh_path=low_mesh_path,
+                tokens_path=None,
+                stats=stats,
+            )
 
         import torch
 
@@ -60,11 +103,10 @@ class ReconstructionService:
                 "in the current runtime."
             )
 
-        import atom3d
         from atom3d.grid import OctreeIndexer
         from faithcontour import FCTDecoder, FCTEncoder
 
-        kernel_diag = self._ensure_atom3d_cuda_runtime(device=device, atom3d_module=atom3d)
+        kernel_diag = ensure_atom3d_cuda_runtime(device=device, strict=True, require_cuda=True)
         from atom3d import MeshBVH  # Import after runtime patching.
 
         resolution_schedule = self._build_resolution_schedule(
@@ -119,6 +161,7 @@ class ReconstructionService:
                 "decode_seconds": round(float(sum(float(a["decode_seconds"]) for a in attempts)), 6),
                 "total_seconds": total_seconds,
             }
+            merge_runtime_diag(stats, kernel_diag)
             with (output_dir / "reconstruction_stats.json").open("w", encoding="utf-8") as handle:
                 json.dump(stats, handle, indent=2)
             raise RuntimeError(
@@ -146,6 +189,8 @@ class ReconstructionService:
             )
 
         stats: Dict[str, Any] = {
+            "reconstruction_backend_requested": backend_name,
+            "reconstruction_backend_used": backend_name,
             "resolution_requested": int(resolution),
             "resolution": int(resolution_used),
             "resolution_used": int(resolution_used),
@@ -162,6 +207,7 @@ class ReconstructionService:
             "decode_seconds": round(float(chosen["stats"]["decode_seconds"]), 6),
             "total_seconds": total_seconds,
         }
+        merge_runtime_diag(stats, kernel_diag)
         with (output_dir / "reconstruction_stats.json").open("w", encoding="utf-8") as handle:
             json.dump(stats, handle, indent=2)
 
@@ -312,107 +358,3 @@ class ReconstructionService:
             "result": result,
             "stats": stats,
         }
-
-    @staticmethod
-    def _smoke_test_atom3d_kernels() -> None:
-        import torch
-        import atom3d.kernels as kernels_mod
-
-        # Single-triangle vs AABB sanity check.
-        vertices = torch.tensor(
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            dtype=torch.float32,
-            device="cuda",
-        )
-        faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device="cuda")
-        aabb_min = torch.tensor([[0.0, 0.0, -0.1]], dtype=torch.float32, device="cuda")
-        aabb_max = torch.tensor([[1.0, 1.0, 0.1]], dtype=torch.float32, device="cuda")
-
-        hit_mask, _, _ = kernels_mod.triangle_aabb_intersect(vertices, faces, aabb_min, aabb_max)
-        if hit_mask.numel() == 0 or not bool(hit_mask[0].item()):
-            raise RuntimeError(
-                "Atom3d kernel smoke test failed: triangle_aabb_intersect expected a hit but got miss."
-            )
-
-    @classmethod
-    def _ensure_atom3d_cuda_runtime(cls, *, device: str, atom3d_module) -> Dict[str, Any]:
-        global _ATOM3D_KERNEL_DIAG_CACHE
-        if device != "cuda":
-            return {}
-        if _ATOM3D_KERNEL_DIAG_CACHE is not None:
-            return dict(_ATOM3D_KERNEL_DIAG_CACHE)
-
-        import torch
-        from torch.utils.cpp_extension import load
-        from atom3d.core import mesh_bvh as mesh_bvh_mod
-        from atom3d.kernels import bvh as bvh_kernels_mod
-        import atom3d.kernels as kernels_mod
-
-        major, minor = torch.cuda.get_device_capability(0)
-        arch = f"{major}{minor}"
-
-        atom3d_root = Path(atom3d_module.__file__).resolve().parent
-        kernels_root = atom3d_root / "kernels"
-        cumtv_src = kernels_root / "cumtv_kernels.cu"
-        bvh_src = kernels_root / "bvh_kernels.cu"
-        if not cumtv_src.exists() or not bvh_src.exists():
-            raise RuntimeError(
-                "Atom3d CUDA source files are missing. Expected files:\n"
-                f"- {cumtv_src}\n"
-                f"- {bvh_src}"
-            )
-
-        gencode = f"-gencode=arch=compute_{arch},code=sm_{arch}"
-        gencode_ptx = f"-gencode=arch=compute_{arch},code=compute_{arch}"
-
-        cumtv_build = kernels_root / "build"
-        bvh_build = kernels_root / "build" / "bvh"
-        cumtv_build.mkdir(parents=True, exist_ok=True)
-        bvh_build.mkdir(parents=True, exist_ok=True)
-
-        cumtv_name = f"cumtv_cuda_sm{arch}"
-        bvh_name = f"bvh_cuda_sm{arch}"
-
-        try:
-            cumtv_cuda = load(
-                name=cumtv_name,
-                sources=[str(cumtv_src)],
-                build_directory=str(cumtv_build),
-                extra_cuda_cflags=["-O3", "--use_fast_math", gencode, gencode_ptx],
-                verbose=False,
-            )
-            bvh_cuda = load(
-                name=bvh_name,
-                sources=[str(bvh_src)],
-                build_directory=str(bvh_build),
-                extra_cuda_cflags=["-O3", gencode, gencode_ptx],
-                verbose=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to compile Atom3d CUDA kernels for current GPU arch "
-                f"compute capability {major}.{minor} (gencode {gencode}). "
-                f"Original error: {exc}"
-            ) from exc
-
-        kernels_mod._cumtv_cuda = cumtv_cuda
-        kernels_mod._kernel_loaded = True
-        kernels_mod.get_cuda_kernels = lambda: cumtv_cuda
-
-        bvh_kernels_mod._bvh_cuda = bvh_cuda
-        bvh_kernels_mod.get_bvh_kernels = lambda: bvh_cuda
-
-        # Ensure MeshBVH path sees CUDA/BVH as available in this process.
-        mesh_bvh_mod.HAS_CUDA = True
-        mesh_bvh_mod.HAS_BVH = True
-        mesh_bvh_mod.BVHAccelerator = bvh_kernels_mod.BVHAccelerator
-
-        cls._smoke_test_atom3d_kernels()
-        _ATOM3D_KERNEL_DIAG_CACHE = {
-            "gpu_compute_capability": f"{major}.{minor}",
-            "atom3d_arch": arch,
-            "atom3d_cumtv_module": cumtv_name,
-            "atom3d_bvh_module": bvh_name,
-            "atom3d_smoke_test": "passed",
-        }
-        return dict(_ATOM3D_KERNEL_DIAG_CACHE)

@@ -9,6 +9,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
 
+from .atom3d_runtime import merge_runtime_diag
 from .uv import DEFAULT_OPTIONS, METHOD_ALIASES, deep_merge_dict
 from .uv.correspondence import (
     bvh_project_points,
@@ -17,6 +18,8 @@ from .uv.quality import compute_uv_quality
 from .uv.texture_io import extract_uv, resolve_basecolor_image, resolve_device
 from .uv.hybrid_pipeline import run_hybrid_global_opt
 from .uv.method2_pipeline import run_method2_gradient_poisson
+from .uv.method2p_pipeline import run_method2p_projected_gradient_poisson
+from .uv.method25_pipeline import run_method25_projected_jacobian_injective
 from .uv.method4_pipeline import run_method4_jacobian_injective
 from ..mesh_io import MeshIO
 from ..types import UVArtifact
@@ -112,6 +115,8 @@ class UVProjector:
             "barycentric_closest_point",
             "hybrid_global_opt",
             "method2_gradient_poisson",
+            "method2p_projected_gradient_poisson",
+            "method25_projected_jacobian_injective",
             "method4_jacobian_injective",
         }:
             raise ValueError(f"Unsupported UV method: {method}")
@@ -142,6 +147,24 @@ class UVProjector:
             )
         elif method_name == "method2_gradient_poisson":
             mapped_uv, method_stats, export_payload = self._map_method2_gradient_poisson(
+                high_mesh,
+                low_mesh,
+                high_uv,
+                image,
+                device,
+                cfg,
+            )
+        elif method_name == "method2p_projected_gradient_poisson":
+            mapped_uv, method_stats, export_payload = self._map_method2p_projected_gradient_poisson(
+                high_mesh,
+                low_mesh,
+                high_uv,
+                image,
+                device,
+                cfg,
+            )
+        elif method_name == "method25_projected_jacobian_injective":
+            mapped_uv, method_stats, export_payload = self._map_method25_projected_jacobian_injective(
                 high_mesh,
                 low_mesh,
                 high_uv,
@@ -180,6 +203,9 @@ class UVProjector:
             **quality,
             **method_stats,
         }
+        merge_runtime_diag(stats, method_stats)
+        if stats.get("runtime_diag") is not None and stats.get("kernel_diag") is None:
+            stats["kernel_diag"] = dict(stats["runtime_diag"])
         stats.setdefault("uv_correspondence_success_ratio", 1.0)
         stats.setdefault("uv_color_reproj_l1", None)
         stats.setdefault("uv_color_reproj_l2", None)
@@ -307,9 +333,12 @@ class UVProjector:
             chunk_size=int(cfg["correspondence"]["bvh_chunk_size"]),
         )
         mapped_uv = out["mapped_uv"]
+        runtime_diag = dict(out.get("runtime_diag") or {})
+        runtime_diag.pop("reason", None)
         return mapped_uv, {
             "uv_correspondence_success_ratio": 1.0,
             "uv_correspondence_primary_ratio": 1.0,
+            **runtime_diag,
         }
 
     def _map_hybrid_global_opt(
@@ -362,6 +391,46 @@ class UVProjector:
         cfg: Dict[str, Any],
     ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
         return run_method4_jacobian_injective(
+            high_mesh=high_mesh,
+            low_mesh=low_mesh,
+            high_uv=high_uv,
+            image=image,
+            device=device,
+            cfg=cfg,
+            nearest_mapper=self._map_nearest_vertex,
+            barycentric_mapper=self._map_barycentric_closest,
+        )
+
+    def _map_method2p_projected_gradient_poisson(
+        self,
+        high_mesh: trimesh.Trimesh,
+        low_mesh: trimesh.Trimesh,
+        high_uv: np.ndarray,
+        image,
+        device: str,
+        cfg: Dict[str, Any],
+    ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+        return run_method2p_projected_gradient_poisson(
+            high_mesh=high_mesh,
+            low_mesh=low_mesh,
+            high_uv=high_uv,
+            image=image,
+            device=device,
+            cfg=cfg,
+            nearest_mapper=self._map_nearest_vertex,
+            barycentric_mapper=self._map_barycentric_closest,
+        )
+
+    def _map_method25_projected_jacobian_injective(
+        self,
+        high_mesh: trimesh.Trimesh,
+        low_mesh: trimesh.Trimesh,
+        high_uv: np.ndarray,
+        image,
+        device: str,
+        cfg: Dict[str, Any],
+    ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+        return run_method25_projected_jacobian_injective(
             high_mesh=high_mesh,
             low_mesh=low_mesh,
             high_uv=high_uv,

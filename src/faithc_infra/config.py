@@ -6,6 +6,21 @@ from typing import Any, Dict
 
 import yaml
 
+from .services.uv.options import DEFAULT_OPTIONS as DEFAULT_UV_OPTIONS
+
+_ALLOWED_SAMPLE_KEYS = {
+    "name",
+    "high_mesh",
+}
+
+
+def _default_uv_pipeline_config() -> Dict[str, Any]:
+    return {
+        "enabled": True,
+        "method": "method2_gradient_poisson",
+        **copy.deepcopy(DEFAULT_UV_OPTIONS),
+    }
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "project": {
@@ -22,6 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "device": "cuda",
         "reconstruction": {
             "enabled": True,
+            "backend": "pymeshlab_qem",
             "resolution": 8,
             "margin": 0.05,
             "tri_mode": "auto",
@@ -36,127 +52,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "lambda_d": 1e-3,
                 "weight_power": 1,
             },
+            "pymeshlab": {
+                "target_face_count": 0,
+                "target_face_ratio": 0.05,
+                "quality_threshold": 0.3,
+                "preserve_boundary": False,
+                "boundary_weight": 2.0,
+                "preserve_normal": False,
+                "preserve_topology": False,
+                "optimal_placement": True,
+                "planar_quadric": False,
+                "planar_weight": 1e-3,
+                "quality_weight": False,
+                "autoclean": True,
+            },
         },
         "uv": {
-            "enabled": True,
-            "method": "method2_gradient_poisson",
-            "sample": {
-                "base_per_face": 4,
-                "min_per_face": 3,
-                "max_per_face": 12,
-                "seed": 12345,
-            },
-            "correspondence": {
-                "normal_weight": 0.2,
-                "normal_dot_min": 0.7,
-                "ray_max_dist_ratio": 0.08,
-                "fallback_k": 8,
-                "fallback_weight": 0.7,
-                "bvh_chunk_size": 200000,
-            },
-            "seam": {
-                "strategy": "legacy",
-                "uv_span_threshold": 0.35,
-                "min_valid_samples_per_face": 2,
-                "exclude_cross_seam_faces": True,
-                "local_vertex_split": True,
-                "high_position_eps": 1e-6,
-                "high_uv_eps": 1e-5,
-            },
-            "iterative": {
-                "enabled": True,
-                "min_iters": 2,
-                "max_iters": 4,
-                "strict_mode_from_iter": 2,
-                "label_change_tol": 0.02,
-                "energy_rel_tol": 1e-3,
-                "patience": 1,
-                "unknown_face_policy": "exclude",
-            },
-            "solve": {
-                "backend": "auto",
-                "lambda_smooth": 2e-4,
-                "pcg_max_iter": 2000,
-                "pcg_tol": 1e-6,
-                "pcg_check_every": 25,
-                "pcg_preconditioner": "jacobi",
-                "cg_max_iter": 2000,
-                "cg_tol": 1e-6,
-                "anchor_weight": 1e2,
-                "ridge_eps": 1e-8,
-            },
-            "texture_weight": {
-                "enabled": True,
-                "grad_weight_gamma": 1.0,
-                "max_weight": 5.0,
-            },
-            "method2": {
-                "outlier_sigma": 4.0,
-                "outlier_quantile": 0.95,
-                "min_samples_per_face": 2,
-                "face_weight_floor": 1e-6,
-                "use_island_guard": False,
-                "adaptive_anchor_enabled": True,
-                "anchor_mode": "component_minimal",
-                "anchor_points_per_component": 4,
-                "anchor_min_points_per_component": 3,
-                "anchor_max_points_per_component": 5,
-                "anchor_target_vertices_per_anchor": 8000,
-                "anchor_confidence_floor": 0.2,
-                "anchor_confidence_power": 1.0,
-                "anchor_boundary_boost": 0.5,
-                "anchor_curvature_boost": 0.5,
-                "hard_anchor_enabled": False,
-                "hard_anchor_conf_min": 0.85,
-                "hard_anchor_min_per_component": 2,
-                "hard_anchor_max_per_component": 4,
-                "irls_iters": 2,
-                "huber_delta": 3.0,
-                "post_align_translation": True,
-                "post_align_min_samples": 64,
-                "post_align_max_shift": 0.25,
-                "adaptive_smooth_enabled": True,
-                "adaptive_smooth_beta": 2.0,
-                "adaptive_smooth_min_alpha": 0.25,
-                "adaptive_smooth_max_alpha": 1.5,
-                "laplacian_mode": "cotan",
-                "system_cond_estimate": "diag_ratio",
-                "solve_per_island": True,
-            },
-            "method4": {
-                "enabled": True,
-                "device": "auto",
-                "optimizer": "lbfgs",
-                "max_iters": 120,
-                "lr": 0.25,
-                "jacobian_weight": 1.0,
-                "smooth_weight": 1e-6,
-                "sym_dirichlet_weight": 2e-2,
-                "logdet_barrier_weight": 1e-2,
-                "flip_barrier_weight": 5e-2,
-                "barrier_weight": 0.0,
-                "anchor_weight": 5e-4,
-                "det_eps": 1e-7,
-                "det_softplus_beta": 40.0,
-                "area_eps": 1e-10,
-                "grad_clip": 5.0,
-                "early_stop_rel_tol": 1e-5,
-                "early_stop_patience": 10,
-                "max_line_search_fail": 16,
-                "line_search_alpha": 0.5,
-                "line_search_c1": 1e-4,
-                "patch_refine_rounds": 3,
-                "patch_refine_steps": 80,
-                "patch_refine_lr": 0.05,
-                "pre_repair_enabled": True,
-                "pre_repair_iters": 8,
-                "pre_repair_step": 0.25,
-                "fallback_to_method2_on_violation": True,
-                "fallback_violation_ratio_tol": 0.02,
-                "fallback_violation_count_tol": 8,
-                "barrier_homotopy_enabled": True,
-                "barrier_homotopy_warmup_iters": 40,
-            },
+            **_default_uv_pipeline_config(),
         },
         "eval": {
             "enabled": True,
@@ -183,11 +95,57 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return base
 
 
+def _schema_from_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _schema_from_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return []
+    return None
+
+
+_CONFIG_SCHEMA: Dict[str, Any] = _schema_from_value(DEFAULT_CONFIG)
+
+
+def _raise_unknown_keys(path: str, unknown_keys: list[str]) -> None:
+    joined = ", ".join(sorted(unknown_keys))
+    where = path or "<root>"
+    raise ValueError(f"Unknown config key(s) at '{where}': {joined}")
+
+
+def _validate_known_keys(raw: Any, schema: Any, path: str) -> None:
+    if not isinstance(raw, dict):
+        return
+    if not isinstance(schema, dict):
+        raise ValueError(f"Config section '{path}' must not contain nested object values")
+
+    unknown = [str(k) for k in raw.keys() if k not in schema]
+    if unknown:
+        _raise_unknown_keys(path, unknown)
+
+    for key, value in raw.items():
+        next_path = f"{path}.{key}" if path else str(key)
+        next_schema = schema.get(key)
+        if next_path == "data.samples":
+            if not isinstance(value, list):
+                raise ValueError("'data.samples' must be a list")
+            for idx, item in enumerate(value):
+                if not isinstance(item, dict):
+                    raise ValueError(f"'data.samples[{idx}]' must be an object")
+                unknown_item = [str(k) for k in item.keys() if k not in _ALLOWED_SAMPLE_KEYS]
+                if unknown_item:
+                    _raise_unknown_keys(f"data.samples[{idx}]", unknown_item)
+            continue
+        _validate_known_keys(value, next_schema, next_path)
+
+
 class ConfigLoader:
     @staticmethod
     def load(path: Path) -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
+        if not isinstance(raw, dict):
+            raise ValueError("Config root must be a mapping/object")
+        _validate_known_keys(raw, _CONFIG_SCHEMA, "")
 
         config = copy.deepcopy(DEFAULT_CONFIG)
         _deep_merge(config, raw)
@@ -196,9 +154,20 @@ class ConfigLoader:
 
     @staticmethod
     def _validate(config: Dict[str, Any]) -> None:
+        for key in ("project", "paths", "data", "pipeline"):
+            if not isinstance(config.get(key), dict):
+                raise ValueError(f"'{key}' must be an object")
+
+        pipeline = config.get("pipeline", {})
+        for key in ("reconstruction", "uv", "eval", "render"):
+            if not isinstance(pipeline.get(key), dict):
+                raise ValueError(f"'pipeline.{key}' must be an object")
+
         samples = config.get("data", {}).get("samples", [])
         if not isinstance(samples, list):
             raise ValueError("'data.samples' must be a list")
-        for item in samples:
+        for idx, item in enumerate(samples):
+            if not isinstance(item, dict):
+                raise ValueError(f"'data.samples[{idx}]' must be an object")
             if "high_mesh" not in item:
-                raise ValueError("Each sample must provide 'high_mesh'")
+                raise ValueError(f"'data.samples[{idx}]' must provide 'high_mesh'")

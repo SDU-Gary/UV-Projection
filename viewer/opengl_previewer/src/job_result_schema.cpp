@@ -116,9 +116,11 @@ void PopulateResultFromJson(const json &payload, FaithCJobResult &out) {
     using DoubleField = std::pair<const char *, double FaithCJobResult::*>;
     using StringField = std::pair<const char *, std::string FaithCJobResult::*>;
 
-    static const std::array<BoolField, 9> kBoolFields = {
+    static const std::array<BoolField, 11> kBoolFields = {
         BoolField{"success", &FaithCJobResult::success},
         BoolField{"uv_projected", &FaithCJobResult::uv_projected},
+        BoolField{"uv_island_validation_ok", &FaithCJobResult::uv_island_validation_ok},
+        BoolField{"uv_semantic_transfer_component_merge_enabled", &FaithCJobResult::uv_semantic_component_merge_enabled},
         BoolField{"uv_solver_converged_u", &FaithCJobResult::uv_solver_converged_u},
         BoolField{"uv_solver_converged_v", &FaithCJobResult::uv_solver_converged_v},
         BoolField{"uv_island_guard_requested", &FaithCJobResult::uv_island_guard_requested},
@@ -128,12 +130,37 @@ void PopulateResultFromJson(const json &payload, FaithCJobResult &out) {
         BoolField{"uv_m4_pre_repair_enabled", &FaithCJobResult::uv_m4_pre_repair_enabled},
     };
 
-    static const std::array<IntField, 32> kIntFields = {
+    static const std::array<IntField, 39> kIntFields = {
         IntField{"num_input_faces", &FaithCJobResult::input_faces},
         IntField{"num_output_faces", &FaithCJobResult::output_faces},
         IntField{"active_voxels", &FaithCJobResult::active_voxels},
         IntField{"uv_solver_iters_u", &FaithCJobResult::uv_solver_iters_u},
         IntField{"uv_solver_iters_v", &FaithCJobResult::uv_solver_iters_v},
+        IntField{"uv_semantic_transfer_component_merge_min_faces", &FaithCJobResult::uv_semantic_component_merge_min_faces},
+        IntField{
+            "uv_semantic_transfer_component_merge_merged_components",
+            &FaithCJobResult::uv_semantic_component_merge_merged_components,
+        },
+        IntField{
+            "uv_semantic_transfer_component_merge_merged_faces",
+            &FaithCJobResult::uv_semantic_component_merge_merged_faces,
+        },
+        IntField{
+            "uv_semantic_transfer_pre_cleanup_fragmented_label_count",
+            &FaithCJobResult::uv_semantic_pre_cleanup_fragmented_label_count,
+        },
+        IntField{
+            "uv_semantic_transfer_pre_cleanup_severe_label_count",
+            &FaithCJobResult::uv_semantic_pre_cleanup_severe_label_count,
+        },
+        IntField{
+            "uv_semantic_transfer_final_fragmented_label_count",
+            &FaithCJobResult::uv_semantic_final_fragmented_label_count,
+        },
+        IntField{
+            "uv_semantic_transfer_final_severe_label_count",
+            &FaithCJobResult::uv_semantic_final_severe_label_count,
+        },
         IntField{"uv_high_island_count", &FaithCJobResult::uv_high_island_count},
         IntField{"uv_high_seam_edges", &FaithCJobResult::uv_high_seam_edges},
         IntField{"uv_high_boundary_edges", &FaithCJobResult::uv_high_boundary_edges},
@@ -199,12 +226,16 @@ void PopulateResultFromJson(const json &payload, FaithCJobResult &out) {
         DoubleField{"uv_seam_uv_span_threshold", &FaithCJobResult::uv_seam_uv_span_threshold},
     };
 
-    static const std::array<StringField, 21> kStringFields = {
+    static const std::array<StringField, 25> kStringFields = {
         StringField{"error", &FaithCJobResult::message},
         StringField{"uv_mode_used", &FaithCJobResult::uv_mode_used},
         StringField{"uv_method", &FaithCJobResult::uv_method},
         StringField{"uv_seam_strategy_requested", &FaithCJobResult::uv_seam_strategy_requested},
         StringField{"uv_seam_strategy_used", &FaithCJobResult::uv_seam_strategy_used},
+        StringField{"uv_island_validation_mode", &FaithCJobResult::uv_island_validation_mode},
+        StringField{"uv_island_validation_error", &FaithCJobResult::uv_island_validation_error},
+        StringField{"uv_semantic_transfer_sidecar_path", &FaithCJobResult::uv_semantic_transfer_sidecar_path},
+        StringField{"uv_closure_validation_sidecar_path", &FaithCJobResult::uv_closure_validation_sidecar_path},
         StringField{"uv_solver_backend_requested", &FaithCJobResult::uv_solver_backend_requested},
         StringField{"uv_solver_backend_used", &FaithCJobResult::uv_solver_backend_used},
         StringField{"uv_solver_linear_backend_requested", &FaithCJobResult::uv_solver_linear_backend_requested},

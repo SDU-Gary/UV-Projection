@@ -1367,6 +1367,7 @@ private:
             glfwMakeContextCurrent(window_);
             face_heatmap_renderer_.Destroy();
             semantic_heatmap_renderer_.Destroy();
+            semantic_pre_bfs_heatmap_renderer_.Destroy();
             line_renderer_.Destroy();
             mesh_gpu_.Destroy();
             mesh_shader_.Destroy();
@@ -1442,6 +1443,7 @@ private:
         }
         ClearAcceptedSampleHeatmap();
         ClearSemanticHeatmap();
+        ClearSemanticPreBfsHeatmap();
         ClearClosureValidationSummary();
 
         SetCrashStage("LoadMesh:upload_gpu");
@@ -1500,6 +1502,19 @@ private:
         semantic_unique_label_count_ = 0;
         semantic_heatmap_source_.clear();
         semantic_heatmap_status_.clear();
+    }
+
+    void ClearSemanticPreBfsHeatmap() {
+        semantic_pre_bfs_heatmap_renderer_.Destroy();
+        semantic_pre_bfs_heatmap_available_ = false;
+        semantic_pre_bfs_face_count_ = 0;
+        semantic_pre_bfs_nonzero_faces_ = 0;
+        semantic_pre_bfs_strong_faces_ = -1;
+        semantic_pre_bfs_boundary_faces_ = -1;
+        semantic_pre_bfs_unknown_faces_ = -1;
+        semantic_pre_bfs_confidence_mean_ = 0.0f;
+        semantic_pre_bfs_source_.clear();
+        semantic_pre_bfs_status_.clear();
     }
 
     void ClearClosureValidationSummary() {
@@ -1650,11 +1665,126 @@ private:
         return true;
     }
 
+    bool BuildSemanticPreBfsHeatmapFromConfidence(const std::vector<float> &confidence, std::string &error) {
+        if (!mesh_loaded_) {
+            error = "Pre-BFS heatmap build failed: mesh not loaded";
+            return false;
+        }
+        const size_t face_count = mesh_data_.face_count();
+        if (confidence.size() != face_count) {
+            std::ostringstream oss;
+            oss << "Pre-BFS heatmap build failed: confidence length mismatch (" << confidence.size()
+                << " vs face_count " << face_count << ")";
+            error = oss.str();
+            return false;
+        }
+        std::vector<float> scalar(face_count, 0.0f);
+        int nonzero = 0;
+        double sum = 0.0;
+        for (size_t i = 0; i < face_count; ++i) {
+            const float c = std::clamp(confidence[i], 0.0f, 1.0f);
+            scalar[i] = c;
+            sum += static_cast<double>(c);
+            if (c > 0.0f) {
+                nonzero += 1;
+            }
+        }
+        if (!semantic_pre_bfs_heatmap_renderer_.Upload(mesh_data_, scalar, error)) {
+            return false;
+        }
+        semantic_pre_bfs_heatmap_available_ = true;
+        semantic_pre_bfs_face_count_ = static_cast<int>(face_count);
+        semantic_pre_bfs_nonzero_faces_ = nonzero;
+        semantic_pre_bfs_confidence_mean_ = static_cast<float>(sum / std::max<size_t>(1, face_count));
+        return true;
+    }
+
+    bool LoadSemanticTransferFromResult(const FaithCJobResult &result, std::string &error) {
+        ClearSemanticPreBfsHeatmap();
+
+        fs::path sidecar = result.uv_semantic_transfer_sidecar_path.empty()
+                               ? (result.status_json.parent_path() /
+                                  (result.status_json.stem().string() + ".uv_semantic_transfer.json"))
+                               : fs::path(result.uv_semantic_transfer_sidecar_path);
+        std::error_code ec;
+        sidecar = fs::absolute(sidecar, ec);
+        if (ec || !fs::exists(sidecar)) {
+            error = "Semantic-transfer sidecar not found: " + sidecar.string();
+            return false;
+        }
+
+        json payload;
+        try {
+            std::ifstream in(sidecar);
+            in >> payload;
+        } catch (const std::exception &e) {
+            error = std::string("Failed to parse semantic-transfer sidecar: ") + e.what();
+            return false;
+        }
+
+        if (!payload.contains("pre_bfs_confidence") || !payload["pre_bfs_confidence"].is_array()) {
+            error = "Semantic-transfer sidecar missing 'pre_bfs_confidence' array";
+            return false;
+        }
+        std::vector<float> conf;
+        conf.reserve(payload["pre_bfs_confidence"].size());
+        for (const auto &v : payload["pre_bfs_confidence"]) {
+            if (v.is_number()) {
+                conf.push_back(static_cast<float>(v.get<double>()));
+            } else {
+                conf.push_back(0.0f);
+            }
+        }
+        if (!BuildSemanticPreBfsHeatmapFromConfidence(conf, error)) {
+            return false;
+        }
+
+        if (payload.contains("pre_bfs_state") && payload["pre_bfs_state"].is_array()) {
+            int strong = 0;
+            int boundary = 0;
+            int unknown = 0;
+            for (const auto &v : payload["pre_bfs_state"]) {
+                int s = 0;
+                if (v.is_number_integer()) {
+                    s = v.get<int>();
+                } else if (v.is_number_float()) {
+                    s = static_cast<int>(std::llround(v.get<double>()));
+                }
+                if (s == 2) {
+                    strong += 1;
+                } else if (s == 1) {
+                    boundary += 1;
+                } else {
+                    unknown += 1;
+                }
+            }
+            semantic_pre_bfs_strong_faces_ = strong;
+            semantic_pre_bfs_boundary_faces_ = boundary;
+            semantic_pre_bfs_unknown_faces_ = unknown;
+        }
+
+        semantic_pre_bfs_source_ = sidecar.string();
+        std::ostringstream oss;
+        oss << "Pre-BFS confidence loaded: faces=" << semantic_pre_bfs_face_count_
+            << ", nonzero=" << semantic_pre_bfs_nonzero_faces_
+            << ", mean=" << semantic_pre_bfs_confidence_mean_;
+        if (semantic_pre_bfs_strong_faces_ >= 0) {
+            oss << ", strong/boundary/unknown="
+                << semantic_pre_bfs_strong_faces_ << "/" << semantic_pre_bfs_boundary_faces_ << "/"
+                << semantic_pre_bfs_unknown_faces_;
+        }
+        semantic_pre_bfs_status_ = oss.str();
+        return true;
+    }
+
     bool LoadClosureValidationFromResult(const FaithCJobResult &result, std::string &error) {
         ClearSemanticHeatmap();
         ClearClosureValidationSummary();
 
-        fs::path sidecar = result.status_json.parent_path() / (result.status_json.stem().string() + ".uv_closure_validation.json");
+        fs::path sidecar = result.uv_closure_validation_sidecar_path.empty()
+                               ? (result.status_json.parent_path() /
+                                  (result.status_json.stem().string() + ".uv_closure_validation.json"))
+                               : fs::path(result.uv_closure_validation_sidecar_path);
         std::error_code ec;
         sidecar = fs::absolute(sidecar, ec);
         if (ec || !fs::exists(sidecar)) {
@@ -1873,6 +2003,19 @@ private:
             }
         }
 
+        if (show_semantic_pre_bfs_heatmap_ && semantic_pre_bfs_heatmap_available_) {
+            glUseProgram(heatmap_shader_.program);
+            glUniformMatrix4fv(glGetUniformLocation(heatmap_shader_.program, "u_mvp"), 1, GL_FALSE, &mvp[0][0]);
+            glUniform1f(glGetUniformLocation(heatmap_shader_.program, "u_alpha"), semantic_pre_bfs_heatmap_alpha_);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-0.75f, -0.75f);
+            semantic_pre_bfs_heatmap_renderer_.Draw();
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glDisable(GL_BLEND);
+        }
+
         if (show_semantic_heatmap_ && semantic_heatmap_available_) {
             glUseProgram(heatmap_shader_.program);
             glUniformMatrix4fv(glGetUniformLocation(heatmap_shader_.program, "u_mvp"), 1, GL_FALSE, &mvp[0][0]);
@@ -2068,6 +2211,10 @@ private:
         if (!LoadAcceptedSampleHeatmapFromResult(result, heatmap_error)) {
             accepted_sample_heatmap_status_ = heatmap_error;
         }
+        std::string semantic_transfer_error;
+        if (!LoadSemanticTransferFromResult(result, semantic_transfer_error)) {
+            semantic_pre_bfs_status_ = semantic_transfer_error;
+        }
         std::string closure_error;
         if (!LoadClosureValidationFromResult(result, closure_error)) {
             closure_validation_status_ = closure_error;
@@ -2242,8 +2389,10 @@ private:
         ImGui::ColorEdit3("UV Seam Color", &uv_seam_color_.x);
         ImGui::SliderFloat("UV Seam Width", &uv_seam_line_width_, 1.0f, 4.0f, "%.1f");
 
-        ImGui::Checkbox("Semantic-ID Heatmap", &show_semantic_heatmap_);
-        ImGui::SliderFloat("Semantic Heatmap Alpha", &semantic_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
+        ImGui::Checkbox("Semantic Post-BFS Island IDs", &show_semantic_heatmap_);
+        ImGui::SliderFloat("Post-BFS Heatmap Alpha", &semantic_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
+        ImGui::Checkbox("Semantic Pre-BFS Confidence", &show_semantic_pre_bfs_heatmap_);
+        ImGui::SliderFloat("Pre-BFS Heatmap Alpha", &semantic_pre_bfs_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
 
         ImGui::Checkbox("Accepted-Samples Heatmap", &show_accepted_sample_heatmap_);
         ImGui::SliderFloat("Accepted Heatmap Alpha", &accepted_sample_heatmap_alpha_, 0.05f, 1.0f, "%.2f");
@@ -2266,16 +2415,32 @@ private:
             ImGui::TextDisabled("UV seam overlay unavailable for current mesh.");
         }
 
+        if (semantic_pre_bfs_heatmap_available_) {
+            ImGui::Text("Pre-BFS confidence: faces=%d, nonzero=%d, mean=%.4f", semantic_pre_bfs_face_count_,
+                        semantic_pre_bfs_nonzero_faces_, semantic_pre_bfs_confidence_mean_);
+            if (semantic_pre_bfs_strong_faces_ >= 0) {
+                ImGui::Text("Pre-BFS state strong/boundary/unknown: %d / %d / %d", semantic_pre_bfs_strong_faces_,
+                            semantic_pre_bfs_boundary_faces_, semantic_pre_bfs_unknown_faces_);
+            }
+            if (!semantic_pre_bfs_source_.empty()) {
+                ImGui::TextWrapped("Pre-BFS sidecar: %s", semantic_pre_bfs_source_.c_str());
+            }
+        } else if (!semantic_pre_bfs_status_.empty()) {
+            ImGui::TextDisabled("Pre-BFS: %s", semantic_pre_bfs_status_.c_str());
+        } else {
+            ImGui::TextDisabled("Pre-BFS: unavailable");
+        }
+
         if (semantic_heatmap_available_) {
-            ImGui::Text("Semantic labels: faces=%d, unknown=%d, unique=%d", semantic_face_count_,
+            ImGui::Text("Post-BFS labels: faces=%d, unknown=%d, unique=%d", semantic_face_count_,
                         semantic_unknown_face_count_, semantic_unique_label_count_);
             if (!semantic_heatmap_source_.empty()) {
-                ImGui::TextWrapped("Semantic sidecar: %s", semantic_heatmap_source_.c_str());
+                ImGui::TextWrapped("Post-BFS sidecar: %s", semantic_heatmap_source_.c_str());
             }
         } else if (!semantic_heatmap_status_.empty()) {
-            ImGui::TextDisabled("Semantic: %s", semantic_heatmap_status_.c_str());
+            ImGui::TextDisabled("Post-BFS: %s", semantic_heatmap_status_.c_str());
         } else {
-            ImGui::TextDisabled("Semantic: unavailable");
+            ImGui::TextDisabled("Post-BFS: unavailable");
         }
 
         if (accepted_sample_heatmap_available_) {
@@ -2326,6 +2491,7 @@ private:
     LineRenderer line_renderer_;
     FaceHeatmapRenderer face_heatmap_renderer_;
     FaceHeatmapRenderer semantic_heatmap_renderer_;
+    FaceHeatmapRenderer semantic_pre_bfs_heatmap_renderer_;
 
     faithc::viewer::MeshData mesh_data_;
     bool mesh_loaded_ = false;
@@ -2339,6 +2505,7 @@ private:
     bool show_uv_island_seams_ = false;
     bool show_compare_uv_seams_ = true;
     bool show_semantic_heatmap_ = true;
+    bool show_semantic_pre_bfs_heatmap_ = false;
     bool show_accepted_sample_heatmap_ = false;
     bool use_basecolor_texture_ = true;
 
@@ -2351,6 +2518,7 @@ private:
     float uv_seam_position_eps_ = 1e-6f;
     float uv_seam_uv_eps_ = 1e-5f;
     float semantic_heatmap_alpha_ = 0.58f;
+    float semantic_pre_bfs_heatmap_alpha_ = 0.58f;
     float accepted_sample_heatmap_alpha_ = 0.72f;
     bool accepted_sample_heatmap_log_scale_ = true;
 
@@ -2362,16 +2530,25 @@ private:
     std::vector<int> accepted_sample_counts_raw_;
     std::vector<int> semantic_labels_raw_;
     bool semantic_heatmap_available_ = false;
+    bool semantic_pre_bfs_heatmap_available_ = false;
     bool accepted_sample_heatmap_available_ = false;
     int semantic_face_count_ = 0;
     int semantic_unknown_face_count_ = 0;
     int semantic_unique_label_count_ = 0;
+    int semantic_pre_bfs_face_count_ = 0;
+    int semantic_pre_bfs_nonzero_faces_ = 0;
+    int semantic_pre_bfs_strong_faces_ = -1;
+    int semantic_pre_bfs_boundary_faces_ = -1;
+    int semantic_pre_bfs_unknown_faces_ = -1;
+    float semantic_pre_bfs_confidence_mean_ = 0.0f;
     int accepted_sample_face_count_ = 0;
     int accepted_sample_nonzero_faces_ = 0;
     int accepted_sample_max_count_ = 0;
     std::string semantic_heatmap_source_;
+    std::string semantic_pre_bfs_source_;
     std::string closure_sidecar_source_;
     std::string semantic_heatmap_status_;
+    std::string semantic_pre_bfs_status_;
     std::string closure_validation_status_;
     std::string accepted_sample_heatmap_source_;
     std::string accepted_sample_heatmap_status_;
